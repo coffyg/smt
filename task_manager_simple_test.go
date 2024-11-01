@@ -2,6 +2,7 @@ package smt
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"sync"
@@ -180,5 +181,117 @@ func TestAddTaskWithNilProvider(t *testing.T) {
 
 	if !task.completeCalled {
 		t.Error("Expected OnComplete to be called for task with nil provider")
+	}
+}
+func TestTaskManagerSimple_ExecuteCommand(t *testing.T) {
+	// Setup TaskManagerSimple
+	providerName := "testProvider"
+	provider := &MockProvider{name: providerName}
+
+	servers := map[string][]string{
+		providerName: {"server1"},
+	}
+
+	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).With().Timestamp().Logger()
+	getTimeout := func(string) time.Duration {
+		return time.Second * 5
+	}
+
+	tm := NewTaskManagerSimple(&[]IProvider{provider}, servers, &logger, getTimeout)
+	tm.Start()
+	defer tm.Shutdown()
+
+	// Create a normal task with low priority
+	task := &MockTask{
+		id:         "task1",
+		priority:   1,
+		maxRetries: 3,
+		provider:   provider,
+		done:       make(chan struct{}),
+	}
+
+	executionOrder := []string{}
+	var executionOrderLock sync.Mutex
+
+	provider.handleFunc = func(task ITask, server string) error {
+		executionOrderLock.Lock()
+		executionOrder = append(executionOrder, "task")
+		executionOrderLock.Unlock()
+		if mt, ok := task.(*MockTask); ok {
+			mt.startCalled = true
+			if mt.done != nil {
+				close(mt.done)
+			}
+		}
+		return nil
+	}
+
+	tm.AddTask(task)
+
+	// Simulate adding commands in a loop
+	commandExecutedCount := 0
+	totalCommands := 10
+	commandDone := make(chan struct{}, totalCommands)
+
+	for i := 0; i < totalCommands; i++ {
+		idx := i // Capture loop variable
+		err := tm.ExecuteCommand(providerName, func(server string) error {
+			executionOrderLock.Lock()
+			executionOrder = append(executionOrder, fmt.Sprintf("command%d", idx))
+			executionOrderLock.Unlock()
+			commandExecutedCount++
+			commandDone <- struct{}{}
+			return nil
+		})
+		if err != nil {
+			t.Errorf("ExecuteCommand returned error: %v", err)
+		}
+	}
+
+	// Wait for command and task to complete
+	select {
+	case <-task.done:
+		// Task completed
+	case <-time.After(time.Second * 2):
+		t.Error("Timeout waiting for task to complete")
+	}
+
+	// Wait for all commands to complete
+	timeout := time.After(time.Second * 5)
+	for i := 0; i < totalCommands; i++ {
+		select {
+		case <-commandDone:
+			// Command completed
+		case <-timeout:
+			t.Error("Timeout waiting for commands to complete")
+			return
+		}
+	}
+
+	// Verify that the task was executed before the commands
+	if !task.startCalled {
+		t.Error("Task was not executed")
+	}
+
+	// Verify that all commands were executed
+	if commandExecutedCount != totalCommands {
+		t.Errorf("Expected %d commands to be executed, but got %d", totalCommands, commandExecutedCount)
+	}
+
+	// Verify execution order: task should have been processed before commands
+	executionOrderLock.Lock()
+	defer executionOrderLock.Unlock()
+	if len(executionOrder) != totalCommands+1 {
+		t.Errorf("Execution order incorrect, expected %d entries, got %d", totalCommands+1, len(executionOrder))
+	}
+	if executionOrder[0] != "task" {
+		t.Errorf("First execution should be 'task', got '%s'", executionOrder[0])
+	}
+	// Commands should follow
+	for i := 1; i <= totalCommands; i++ {
+		expected := fmt.Sprintf("command%d", i-1)
+		if executionOrder[i] != expected {
+			t.Errorf("Expected execution order '%s', got '%s'", expected, executionOrder[i])
+		}
 	}
 }

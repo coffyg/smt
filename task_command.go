@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"runtime/debug"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type Command struct {
 	commandFunc func(server string) error
+	id          uuid.UUID
 }
 
 func (tm *TaskManagerSimple) ExecuteCommand(providerName string, commandFunc func(server string) error) error {
@@ -20,12 +23,30 @@ func (tm *TaskManagerSimple) ExecuteCommand(providerName string, commandFunc fun
 	if !ok {
 		return fmt.Errorf("provider '%s' not found", providerName)
 	}
+
+	// Generate a UUID for the command
+	cmdID := uuid.New()
+
+	// Check if the command is already being processed
+	pd.commandSetLock.Lock()
+	if _, exists := pd.commandSet[cmdID]; exists {
+		pd.commandSetLock.Unlock()
+		return fmt.Errorf("command with UUID '%s' is already being processed", cmdID)
+	}
+	pd.commandSet[cmdID] = struct{}{}
+	pd.commandSetLock.Unlock()
+
+	// Add the command to the queue
 	pd.taskQueueLock.Lock()
 	defer pd.taskQueueLock.Unlock()
-	pd.commandQueue = append(pd.commandQueue, Command{commandFunc: commandFunc})
+	pd.commandQueue.Enqueue(Command{
+		id:          cmdID,
+		commandFunc: commandFunc,
+	})
 	pd.taskQueueCond.Signal()
 	return nil
 }
+
 func (tm *TaskManagerSimple) processCommand(command Command, providerName, server string) {
 	defer tm.wg.Done()
 	defer func() {
@@ -33,6 +54,10 @@ func (tm *TaskManagerSimple) processCommand(command Command, providerName, serve
 		pd, ok := tm.providers[providerName]
 		if ok {
 			pd.availableServers <- server
+			// Remove the command from the tracking set
+			pd.commandSetLock.Lock()
+			delete(pd.commandSet, command.id)
+			pd.commandSetLock.Unlock()
 		}
 	}()
 	// Handle panics
@@ -76,19 +101,19 @@ func (tm *TaskManagerSimple) HandleCommandWithTimeout(providerName string, comma
 			}
 		}()
 
-		tm.logger.Debug().Msgf("[tms|%s|command] Command STARTED on server %s", providerName, server)
+		tm.logger.Debug().Msgf("[tms|%s|command|%s] Command STARTED on server %s", providerName, command.id, server)
 		done <- command.commandFunc(server)
 	}()
 
 	select {
 	case <-ctx.Done():
-		err = fmt.Errorf("[tms|%s|command] Command timed out on server %s", providerName, server)
-		tm.logger.Error().Err(err).Msgf("[%s|command] Command FAILED-TIMEOUT on server %s, took %s", providerName, server, time.Since(startTime))
+		err = fmt.Errorf("[tms|%s|command|%s] Command timed out on server %s", providerName, command.id, server)
+		tm.logger.Error().Err(err).Msgf("[%s|command|%s] Command FAILED-TIMEOUT on server %s, took %s", providerName, command.id, server, time.Since(startTime))
 	case err = <-done:
 		if err == nil {
-			tm.logger.Debug().Msgf("[tms|%s|command] Command COMPLETED on server %s, took %s", providerName, server, time.Since(startTime))
+			tm.logger.Debug().Msgf("[tms|%s|command|%s] Command COMPLETED on server %s, took %s", providerName, command.id, server, time.Since(startTime))
 		} else {
-			tm.logger.Error().Err(err).Msgf("[tms|%s|command] Command FAILED on server %s, took %s", providerName, server, time.Since(startTime))
+			tm.logger.Error().Err(err).Msgf("[tms|%s|command|%s] Command FAILED on server %s, took %s", providerName, command.id, server, time.Since(startTime))
 		}
 	}
 

@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
 
@@ -31,7 +32,9 @@ type ProviderData struct {
 	taskQueueCond    *sync.Cond
 	servers          []string
 	availableServers chan string
-	commandQueue     []Command
+	commandQueue     *CommandQueue
+	commandSet       map[uuid.UUID]struct{}
+	commandSetLock   sync.Mutex
 }
 
 func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string) time.Duration) *TaskManagerSimple {
@@ -54,7 +57,9 @@ func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, l
 		pd := &ProviderData{
 			taskQueue:        TaskQueuePrio{},
 			taskQueueLock:    sync.Mutex{},
-			commandQueue:     []Command{},
+			commandQueue:     &CommandQueue{commands: []Command{}},
+			commandSet:       make(map[uuid.UUID]struct{}),
+			commandSetLock:   sync.Mutex{},
 			taskQueueCond:    sync.NewCond(&sync.Mutex{}),
 			servers:          serverList,
 			availableServers: make(chan string, len(serverList)),
@@ -161,7 +166,7 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 
 	for {
 		pd.taskQueueLock.Lock()
-		for len(pd.commandQueue) == 0 && pd.taskQueue.Len() == 0 && !tm.HasShutdownRequest() {
+		for pd.taskQueue.Len() == 0 && pd.commandQueue.Len() == 0 && !tm.HasShutdownRequest() {
 			pd.taskQueueCond.Wait()
 		}
 		if tm.HasShutdownRequest() {
@@ -173,15 +178,14 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 		var command Command
 		var taskWithPriority *TaskWithPriority
 
-		if len(pd.commandQueue) > 0 {
-			// Dequeue the command
-			command = pd.commandQueue[0]
-			pd.commandQueue = pd.commandQueue[1:]
-			isCommand = true
-		} else if pd.taskQueue.Len() > 0 {
+		if pd.taskQueue.Len() > 0 {
 			// Get the next task
 			taskWithPriority = heap.Pop(&pd.taskQueue).(*TaskWithPriority)
 			isCommand = false
+		} else if pd.commandQueue.Len() > 0 {
+			// Dequeue the command
+			command, _ = pd.commandQueue.Dequeue()
+			isCommand = true
 		}
 		pd.taskQueueLock.Unlock()
 
