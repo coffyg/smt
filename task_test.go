@@ -2,8 +2,11 @@ package smt
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // Mock implementations for testing interfaces
@@ -25,6 +28,7 @@ type MockTask struct {
 	successTime    int64
 	failedTime     int64
 	done           chan struct{}
+	doneOnce       sync.Once
 }
 
 func (t *MockTask) MarkAsSuccess(time int64) {
@@ -83,7 +87,9 @@ func (t *MockTask) UpdateLastError(errStr string) error {
 func (t *MockTask) OnComplete() {
 	t.completeCalled = true
 	if t.done != nil {
-		close(t.done)
+		t.doneOnce.Do(func() {
+			close(t.done)
+		})
 	}
 }
 
@@ -232,4 +238,95 @@ func TestMockProvider(t *testing.T) {
 	if !called {
 		t.Error("Expected provider Handle function to be called")
 	}
+}
+func TestTaskManagerSimple_ExecuteCommand(t *testing.T) {
+	// Setup TaskManagerSimple
+	providerName := "testProvider"
+	provider := &MockProvider{name: providerName}
+
+	servers := map[string][]string{
+		providerName: {"server1"},
+	}
+
+	logger := zerolog.New(nil)
+	getTimeout := func(string) time.Duration {
+		return time.Second * 5
+	}
+
+	tm := NewTaskManagerSimple(&[]IProvider{provider}, servers, &logger, getTimeout)
+	tm.Start()
+	defer tm.Shutdown()
+
+	// Create a normal task with low priority
+	task := &MockTask{
+		id:         "task1",
+		priority:   1,
+		maxRetries: 3,
+		provider:   provider,
+		done:       make(chan struct{}),
+	}
+
+	executionOrder := []string{}
+	var executionOrderLock sync.Mutex
+
+	provider.handleFunc = func(task ITask, server string) error {
+		executionOrderLock.Lock()
+		executionOrder = append(executionOrder, "task")
+		executionOrderLock.Unlock()
+		if mt, ok := task.(*MockTask); ok {
+			mt.startCalled = true
+			if mt.done != nil {
+				close(mt.done)
+			}
+		}
+		return nil
+	}
+
+	tm.AddTask(task)
+
+	// Create a command function
+	commandExecuted := false
+	commandDone := make(chan struct{})
+	commandFunc := func(server string) error {
+		executionOrderLock.Lock()
+		executionOrder = append(executionOrder, "command")
+		executionOrderLock.Unlock()
+		commandExecuted = true
+		close(commandDone)
+		return nil
+	}
+
+	// Execute the command with higher priority
+	err := tm.ExecuteCommand(providerName, commandFunc)
+	if err != nil {
+		t.Errorf("ExecuteCommand returned error: %v", err)
+	}
+
+	// Wait for command and task to complete
+	select {
+	case <-time.After(time.Second * 1):
+		t.Error("Timeout waiting for command and task to complete")
+	case <-commandDone:
+		// Wait for task
+		select {
+		case <-task.done:
+			// Both command and task completed
+		case <-time.After(time.Second * 1):
+			t.Error("Timeout waiting for task to complete")
+		}
+	}
+
+	// Check that the command was executed before the task
+	if !commandExecuted {
+		t.Error("Command was not executed")
+	}
+	if !task.startCalled {
+		t.Error("Task was not executed after the command")
+	}
+
+	executionOrderLock.Lock()
+	if len(executionOrder) != 2 || executionOrder[0] != "command" || executionOrder[1] != "task" {
+		t.Errorf("Execution order incorrect, expected ['command', 'task'], got %v", executionOrder)
+	}
+	executionOrderLock.Unlock()
 }
