@@ -23,7 +23,7 @@ type TaskManagerSimple struct {
 	shutdownCh      chan struct{}
 	wg              sync.WaitGroup
 	logger          *zerolog.Logger
-	getTimeout      func(string) time.Duration
+	getTimeout      func(string, string) time.Duration
 }
 
 type ProviderData struct {
@@ -37,7 +37,7 @@ type ProviderData struct {
 	commandSetLock   sync.Mutex
 }
 
-func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string) time.Duration) *TaskManagerSimple {
+func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string, string) time.Duration) *TaskManagerSimple {
 	tm := &TaskManagerSimple{
 		providers:       make(map[string]*ProviderData),
 		isRunning:       0,
@@ -309,7 +309,7 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 		}
 	}()
 
-	maxTimeout := tm.getTimeout(pn)
+	maxTimeout := tm.getTimeout(task.GetCallbackName(), pn)
 	ctx, cancel := context.WithTimeout(context.Background(), maxTimeout)
 	defer cancel()
 
@@ -352,7 +352,7 @@ var (
 )
 
 // Initialize the TaskManager
-func InitTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, tasks []ITask, servers map[string][]string, getTimeout func(string) time.Duration) {
+func InitTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, tasks []ITask, servers map[string][]string, getTimeout func(string, string) time.Duration) {
 	taskManagerMutex.Lock()
 	defer taskManagerMutex.Unlock()
 	logger.Info().Msg("[tms] Task manager initialization")

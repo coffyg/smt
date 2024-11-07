@@ -50,7 +50,7 @@ func TestTaskManagerSimple_HarshEnvironment(t *testing.T) {
 	}
 
 	// Define getTimeout function
-	getTimeout := func(providerName string) time.Duration {
+	getTimeout := func(callbakcName string, providerName string) time.Duration {
 		return time.Second * 5
 	}
 
@@ -151,7 +151,7 @@ func TestAddTaskWithNilProvider(t *testing.T) {
 	// Initialize TaskManagerSimple with no providers for simplicity
 	providers := []IProvider{}
 	servers := map[string][]string{}
-	getTimeout := func(string) time.Duration { return time.Second * 10 }
+	getTimeout := func(string, string) time.Duration { return time.Second * 10 }
 	tm := NewTaskManagerSimple(&providers, servers, &logger, getTimeout)
 	tm.Start()
 	defer tm.Shutdown()
@@ -193,7 +193,7 @@ func TestTaskManagerSimple_ExecuteCommand(t *testing.T) {
 	}
 
 	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).With().Timestamp().Logger()
-	getTimeout := func(string) time.Duration {
+	getTimeout := func(string, string) time.Duration {
 		return time.Second * 5
 	}
 

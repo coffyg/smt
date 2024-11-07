@@ -85,7 +85,7 @@ func (tm *TaskManagerSimple) HandleCommandWithTimeout(providerName string, comma
 		}
 	}()
 
-	maxTimeout := tm.getTimeout(providerName)
+	maxTimeout := tm.getTimeout("", providerName)
 	ctx, cancel := context.WithTimeout(context.Background(), maxTimeout)
 	defer cancel()
 

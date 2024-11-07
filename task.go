@@ -18,6 +18,7 @@ type ITask interface {
 	UpdateRetries(int) error
 	GetTimeout() time.Duration
 	UpdateLastError(string) error
+	GetCallbackName() string
 	OnComplete()
 	OnStart()
 }

@@ -64,6 +64,9 @@ func (t *MockTask) GetTaskGroup() ITaskGroup {
 	return t.taskGroup
 }
 
+func (t *MockTask) GetCallbackName() string {
+	return "testCallback"
+}
 func (t *MockTask) GetProvider() IProvider {
 	return t.provider
 }
