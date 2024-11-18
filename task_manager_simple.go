@@ -381,7 +381,7 @@ func AddTask(task ITask, logger *zerolog.Logger) {
 	tries := 0
 	for {
 		if tries >= addMaxRetries {
-			logger.Error().Msg("[tms|add-task] Task not added, max retries reached")
+			logger.Debug().Msg("[tms|add-task] Task not added, max retries reached")
 			return
 		}
 		taskManagerMutex.Lock()
