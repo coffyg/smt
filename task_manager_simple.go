@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -77,13 +78,13 @@ func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, l
 
 	return tm
 }
-func (tm *TaskManagerSimple) SetTaskManagerServerMaxParallel(server string, maxParallel int) {
+func (tm *TaskManagerSimple) SetTaskManagerServerMaxParallel(prefix string, maxParallel int) {
 	tm.serverConcurrencyMu.Lock()
 	defer tm.serverConcurrencyMu.Unlock()
 	if maxParallel <= 0 {
-		delete(tm.serverConcurrencyMap, server)
+		delete(tm.serverConcurrencyMap, prefix)
 	} else {
-		tm.serverConcurrencyMap[server] = make(chan struct{}, maxParallel)
+		tm.serverConcurrencyMap[prefix] = make(chan struct{}, maxParallel)
 	}
 }
 
@@ -222,9 +223,17 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 	started := time.Now()
 	var onCompleteCalled bool
 
-	// Acquire semaphore if server has concurrency limit
+	// Acquire semaphore if server URL matches any prefix with concurrency limit
 	tm.serverConcurrencyMu.RLock()
-	semaphore, hasLimit := tm.serverConcurrencyMap[server]
+	var semaphore chan struct{}
+	var hasLimit bool
+	for prefix, sem := range tm.serverConcurrencyMap {
+		if strings.HasPrefix(server, prefix) {
+			semaphore = sem
+			hasLimit = true
+			break
+		}
+	}
 	tm.serverConcurrencyMu.RUnlock()
 	if hasLimit {
 		semaphore <- struct{}{}
