@@ -142,6 +142,7 @@ Finished:
 
 	// Shutdown TaskManager
 	TaskQueueManagerInstance.Shutdown()
+	time.Sleep(time.Second) // Wait briefly to allow goroutines to exit
 }
 
 // Tests for AddTask with nil provider
@@ -293,5 +294,81 @@ func TestTaskManagerSimple_ExecuteCommand(t *testing.T) {
 		if executionOrder[i] != expected {
 			t.Errorf("Expected execution order '%s', got '%s'", expected, executionOrder[i])
 		}
+	}
+}
+
+func TestTaskManagerShutdownWithParallelismLimit(t *testing.T) {
+	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout})
+
+	// Create mock providers and tasks
+	providerName := "mockProvider"
+	provider := &MockProvider{name: providerName}
+	providers := []IProvider{provider}
+
+	servers := map[string][]string{
+		providerName: {"server1"},
+	}
+
+	getTimeout := func(string, string) time.Duration {
+		return time.Second * 5
+	}
+
+	// Initialize the TaskManager
+	tm := NewTaskManagerSimple(&providers, servers, &logger, getTimeout)
+
+	// Set server max parallelism to 1
+	tm.SetTaskManagerServerMaxParallel("server1", 1)
+
+	// Start the TaskManager
+	tm.Start()
+
+	// Create tasks that will block
+	task1 := &MockTask{
+		id:         "task1",
+		provider:   provider,
+		maxRetries: 1,
+		timeout:    time.Second * 5,
+		done:       make(chan struct{}),
+	}
+
+	task2 := &MockTask{
+		id:         "task2",
+		provider:   provider,
+		maxRetries: 1,
+		timeout:    time.Second * 5,
+		done:       make(chan struct{}),
+	}
+
+	// Mock provider to simulate long-running tasks
+	var taskRunning sync.WaitGroup
+	taskRunning.Add(2)
+
+	provider.handleFunc = func(task ITask, server string) error {
+		taskRunning.Done()
+		select {
+		case <-task.(*MockTask).done:
+			return nil
+		case <-time.After(time.Second * 10):
+			return nil
+		}
+	}
+
+	// Add tasks
+	tm.AddTask(task1)
+	tm.AddTask(task2)
+
+	// Wait until tasks are running
+	taskRunning.Wait()
+
+	// Initiate shutdown
+	tm.Shutdown()
+
+	// Signal tasks to complete
+	close(task1.done)
+	close(task2.done)
+
+	// Verify that the TaskManager has stopped
+	if tm.IsRunning() {
+		t.Error("TaskManager should be stopped after Shutdown")
 	}
 }

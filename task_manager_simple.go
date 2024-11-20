@@ -16,14 +16,16 @@ import (
 
 // TaskManagerSimple interface (optimized)
 type TaskManagerSimple struct {
-	providers       map[string]*ProviderData
-	taskInQueue     sync.Map
-	isRunning       int32
-	shutdownRequest int32
-	shutdownCh      chan struct{}
-	wg              sync.WaitGroup
-	logger          *zerolog.Logger
-	getTimeout      func(string, string) time.Duration
+	providers            map[string]*ProviderData
+	taskInQueue          sync.Map
+	isRunning            int32
+	shutdownRequest      int32
+	shutdownCh           chan struct{}
+	wg                   sync.WaitGroup
+	logger               *zerolog.Logger
+	getTimeout           func(string, string) time.Duration
+	serverConcurrencyMap map[string]chan struct{} // Map of servers to semaphores
+	serverConcurrencyMu  sync.RWMutex
 }
 
 type ProviderData struct {
@@ -39,12 +41,14 @@ type ProviderData struct {
 
 func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string, string) time.Duration) *TaskManagerSimple {
 	tm := &TaskManagerSimple{
-		providers:       make(map[string]*ProviderData),
-		isRunning:       0,
-		shutdownRequest: 0,
-		shutdownCh:      make(chan struct{}),
-		logger:          logger,
-		getTimeout:      getTimeout,
+		providers:            make(map[string]*ProviderData),
+		isRunning:            0,
+		shutdownRequest:      0,
+		shutdownCh:           make(chan struct{}),
+		logger:               logger,
+		getTimeout:           getTimeout,
+		serverConcurrencyMap: make(map[string]chan struct{}),
+		serverConcurrencyMu:  sync.RWMutex{},
 	}
 
 	// Initialize providers
@@ -72,6 +76,15 @@ func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, l
 	}
 
 	return tm
+}
+func (tm *TaskManagerSimple) SetTaskManagerServerMaxParallel(server string, maxParallel int) {
+	tm.serverConcurrencyMu.Lock()
+	defer tm.serverConcurrencyMu.Unlock()
+	if maxParallel <= 0 {
+		delete(tm.serverConcurrencyMap, server)
+	} else {
+		tm.serverConcurrencyMap[server] = make(chan struct{}, maxParallel)
+	}
 }
 
 func (tm *TaskManagerSimple) HasShutdownRequest() bool {
@@ -209,8 +222,19 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 	started := time.Now()
 	var onCompleteCalled bool
 
+	// Acquire semaphore if server has concurrency limit
+	tm.serverConcurrencyMu.RLock()
+	semaphore, hasLimit := tm.serverConcurrencyMap[server]
+	tm.serverConcurrencyMu.RUnlock()
+	if hasLimit {
+		semaphore <- struct{}{}
+	}
+
 	defer tm.wg.Done()
 	defer func() {
+		if hasLimit {
+			<-semaphore
+		}
 		// Return the server to the available servers pool
 		pd, ok := tm.providers[providerName]
 		if ok {
