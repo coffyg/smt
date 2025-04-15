@@ -62,7 +62,7 @@ func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, l
 		pd := &ProviderData{
 			taskQueue:        TaskQueuePrio{},
 			taskQueueLock:    sync.Mutex{},
-			commandQueue:     &CommandQueue{commands: []Command{}},
+			commandQueue:     NewCommandQueue(32), // Initialize with a reasonable capacity
 			commandSet:       make(map[uuid.UUID]struct{}),
 			commandSetLock:   sync.Mutex{},
 			taskQueueCond:    sync.NewCond(&sync.Mutex{}),
@@ -310,6 +310,7 @@ func (tm *TaskManagerSimple) HandleTask(task ITask, server string) error {
 	if provider == nil {
 		return fmt.Errorf("task '%s' has no provider", task.GetID())
 	}
+
 	return provider.Handle(task, server)
 }
 
