@@ -34,6 +34,15 @@ type TaskManagerSimple struct {
 	compactionInterval   time.Duration            // Interval between compaction runs
 	compactionThreshold  int                      // Minimum queue size to trigger compaction
 	compactionStop       chan struct{}            // Channel to signal compaction to stop
+	
+	// Adaptive timeout settings
+	adaptiveTimeout      *AdaptiveTimeoutManager  // Manages adaptive timeouts
+	originalTimeoutFunc  func(string, string) time.Duration // Original timeout function
+	adaptiveTimeoutStop  chan struct{}            // Channel to signal adaptive timeout worker to stop
+	
+	// Two-level dispatching settings
+	twoLevelDispatch     *TwoLevelDispatchManager // Manages two-level dispatching
+	enableTwoLevel       bool                     // Whether two-level dispatching is enabled
 }
 
 type ProviderData struct {
@@ -62,6 +71,12 @@ func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, l
 		EnableCompaction:     true,  // Enable background compaction for memory optimization
 		CompactionInterval:   1 * time.Minute,
 		CompactionThreshold:  50,
+		
+		// Adaptive timeout settings
+		EnableAdaptiveTimeout: true, // Enable adaptive timeouts for optimal performance
+		
+		// Two-level dispatching settings
+		EnableTwoLevel:       true,  // Enable two-level dispatching for improved scalability
 	})
 }
 
@@ -79,6 +94,12 @@ type TaskManagerOptions struct {
 	EnableCompaction    bool          // Whether to enable background task compaction
 	CompactionInterval  time.Duration // Interval between compaction runs (default: 1 minute)
 	CompactionThreshold int           // Minimum queue size for compaction (default: 50)
+	
+	// Adaptive timeout settings
+	EnableAdaptiveTimeout bool        // Whether to enable adaptive timeouts
+	
+	// Two-level dispatching settings
+	EnableTwoLevel     bool          // Whether to enable two-level dispatching
 }
 
 // NewTaskManagerWithPool creates a task manager with memory pooling for task wrappers
@@ -125,17 +146,48 @@ func NewTaskManagerWithOptions(providers *[]IProvider, servers map[string][]stri
 		}
 	}
 	
+	// Create adaptive timeout manager if enabled
+	adaptiveTimeoutMgr := NewAdaptiveTimeoutManager(options.EnableAdaptiveTimeout)
+	
+	// Create a wrapper for the timeout function to use adaptive timeouts
+	var timeoutFunc func(string, string) time.Duration
+	if options.EnableAdaptiveTimeout {
+		// Store the original function and create a new one that uses adaptive timeouts
+		timeoutFunc = func(callback, provider string) time.Duration {
+			// Get the base timeout from the original function
+			baseTimeout := getTimeout(callback, provider)
+			
+			// Register this timeout with the adaptive manager
+			adaptiveTimeoutMgr.RegisterBaseTimeout(provider, callback, baseTimeout)
+			
+			// Get the adjusted timeout
+			return adaptiveTimeoutMgr.GetTimeout(callback, provider)
+		}
+	} else {
+		// Use the original timeout function
+		timeoutFunc = getTimeout
+	}
+	
 	tm := &TaskManagerSimple{
 		providers:            make(map[string]*ProviderData, len(*providers)),
 		shutdownCh:           make(chan struct{}),
 		logger:               logger,
-		getTimeout:           getTimeout,
+		getTimeout:           timeoutFunc,
+		originalTimeoutFunc:  getTimeout,
 		serverConcurrencyMap: make(map[string]chan struct{}),
 		enableCompaction:     options.EnableCompaction,
 		compactionInterval:   options.CompactionInterval,
 		compactionThreshold:  options.CompactionThreshold,
 		compactionStop:       make(chan struct{}),
 		serverConcurrencyMu:  sync.RWMutex{},
+		adaptiveTimeout:      adaptiveTimeoutMgr,
+		adaptiveTimeoutStop:  make(chan struct{}),
+		enableTwoLevel:       options.EnableTwoLevel,
+	}
+	
+	// Initialize two-level dispatch manager if enabled
+	if options.EnableTwoLevel {
+		tm.twoLevelDispatch = NewTwoLevelDispatchManager(tm, true)
 	}
 
 	// Initialize providers - this is done only once, so optimize for clarity
@@ -275,6 +327,35 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 	// Now that the task is confirmed valid and the provider exists, set it as in queue
 	tm.setTaskInQueue(taskID)
 
+	// Try to use two-level dispatch if enabled
+	if tm.enableTwoLevel && tm.twoLevelDispatch != nil {
+		// Attempt to get a server from the available servers
+		var server string
+		select {
+		case server = <-pd.availableServers:
+			// Got a server, use it
+			if tm.twoLevelDispatch.EnqueueTask(task, server) {
+				// Successfully enqueued in two-level dispatch
+				return true
+			}
+			// Return the server if two-level dispatch failed
+			pd.availableServers <- server
+		default:
+			// No servers available, use two-level dispatch's server selection
+			if tm.twoLevelDispatch.EnqueueTaskWithServerSelection(task, func(servers []string) string {
+				// Simple round-robin selection
+				if len(servers) > 0 {
+					return servers[0]
+				}
+				return ""
+			}) {
+				// Successfully enqueued in two-level dispatch
+				return true
+			}
+		}
+	}
+
+	// Fallback to traditional queue if two-level dispatch failed or is disabled
 	pd.taskQueueLock.Lock()
 	heap.Push(&pd.taskQueue, &TaskWithPriority{
 		task:     task,
@@ -308,6 +389,12 @@ func (tm *TaskManagerSimple) Start() {
 	if tm.enableCompaction {
 		tm.wg.Add(1)
 		go tm.startCompactionWorker()
+	}
+	
+	// Start background adaptive timeout worker if enabled
+	if tm.adaptiveTimeout != nil && tm.adaptiveTimeout.IsEnabled() {
+		tm.wg.Add(1)
+		go tm.startAdaptiveTimeoutWorker()
 	}
 	
 	// If we have no workers (no servers), log a warning
@@ -470,6 +557,98 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 	}
 }
 
+// processTaskTwoLevel processes a task using the two-level dispatch mechanism
+func (tm *TaskManagerSimple) processTaskTwoLevel(task ITask, providerName, server string) {
+	started := time.Now()
+	var onCompleteCalled bool
+	taskID := task.GetID()
+
+	// Try to acquire semaphore if server URL matches any prefix with concurrency limit
+	var semaphore chan struct{}
+	var hasLimit bool
+
+	// Critical path optimization: Use RLock for concurrent reads
+	tm.serverConcurrencyMu.RLock()
+	for prefix, sem := range tm.serverConcurrencyMap {
+		if strings.HasPrefix(server, prefix) {
+			semaphore = sem
+			hasLimit = true
+			break
+		}
+	}
+	tm.serverConcurrencyMu.RUnlock()
+	
+	// Acquire semaphore if needed
+	if hasLimit {
+		semaphore <- struct{}{}
+		defer func() {
+			<-semaphore
+		}()
+	}
+	
+	// Handle panics
+	defer func() {
+		if r := recover(); r != nil {
+			err := fmt.Errorf("panic occurred: %v\n%s", r, string(debug.Stack()))
+			tm.logger.Error().Err(err).Msgf("[tms-twolevel|%s|%s|%s] panic", providerName, taskID, server)
+			task.MarkAsFailed(time.Since(started).Milliseconds(), err)
+			if !onCompleteCalled {
+				task.OnComplete()
+				onCompleteCalled = true
+			}
+			tm.delTaskInQueue(taskID)
+		}
+	}()
+
+	// Ensure the task has a valid provider
+	if task.GetProvider() == nil {
+		err := fmt.Errorf("task '%s' has no provider", taskID)
+		tm.logger.Error().Err(err).Msgf("[tms-twolevel|%s|%s|%s] Task has no provider", providerName, taskID, server)
+		task.MarkAsFailed(time.Since(started).Milliseconds(), err)
+		if !onCompleteCalled {
+			task.OnComplete()
+			onCompleteCalled = true
+		}
+		tm.delTaskInQueue(taskID)
+		return
+	}
+
+	// Handle the task
+	err, totalTime := tm.HandleWithTimeout(providerName, task, server, tm.HandleTask)
+	if err != nil {
+		retries := task.GetRetries()
+		maxRetries := task.GetMaxRetries()
+		if retries >= maxRetries || err == sql.ErrNoRows {
+			tm.logger.Error().Err(err).Msgf("[tms-twolevel|%s|%s|%s] max retries reached", providerName, taskID, server)
+			task.MarkAsFailed(totalTime, err)
+			if !onCompleteCalled {
+				task.OnComplete()
+				onCompleteCalled = true
+			}
+			tm.delTaskInQueue(taskID)
+		} else {
+			// For retry, don't call OnComplete as the task will be requeued
+			// Just update retries and remove from current queue
+			tm.logger.Debug().Err(err).Msgf("[tms-twolevel|%s|%s|%s] retrying (%d/%d)", providerName, taskID, server, retries+1, maxRetries)
+			task.UpdateRetries(retries + 1)
+			
+			// Remove from queue to avoid duplicates
+			tm.delTaskInQueue(taskID)
+			
+			// Add back to queue with new retry count
+			tm.AddTask(task)
+		}
+	} else {
+		task.MarkAsSuccess(totalTime)
+		if !onCompleteCalled {
+			task.OnComplete()
+			onCompleteCalled = true
+		}
+		tm.delTaskInQueue(taskID)
+	}
+}
+
+
 func (tm *TaskManagerSimple) HandleTask(task ITask, server string) error {
 	provider := task.GetProvider()
 	if provider == nil {
@@ -499,6 +678,16 @@ func (tm *TaskManagerSimple) Shutdown() {
 	// Signal compaction worker to stop if enabled
 	if tm.enableCompaction {
 		close(tm.compactionStop)
+	}
+	
+	// Signal adaptive timeout worker to stop if enabled
+	if tm.adaptiveTimeout != nil && tm.adaptiveTimeout.IsEnabled() {
+		close(tm.adaptiveTimeoutStop)
+	}
+	
+	// Shutdown two-level dispatch if enabled
+	if tm.enableTwoLevel && tm.twoLevelDispatch != nil {
+		tm.twoLevelDispatch.Shutdown()
 	}
 
 	// Signal all provider dispatchers to wake up
@@ -556,13 +745,21 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 	}()
 
 	// Wait for done or timeout
+	var execTimeMs int64
 	select {
 	case <-ctx.Done():
 		err = newTaskError("HandleWithTimeout", task.GetID(), pn, server, ErrTaskTimeout)
+		execTimeMs = time.Since(startTime).Milliseconds()
 		tm.logger.Error().Err(err).Msgf("[%s|%s] Task FAILED-TIMEOUT on server %s, took %s", pn, task.GetID(), server, time.Since(startTime))
 	case err = <-done:
+		execTimeMs = time.Since(startTime).Milliseconds()
 		if err == nil {
 			tm.logger.Debug().Msgf("[tms|%s|%s] Task COMPLETED on server %s, took %s", pn, task.GetID(), server, time.Since(startTime))
+			
+			// Record successful execution in adaptive timeout manager
+			if tm.adaptiveTimeout != nil && tm.adaptiveTimeout.IsEnabled() {
+				tm.adaptiveTimeout.RecordExecution(pn, task.GetCallbackName(), execTimeMs, maxTimeout)
+			}
 		} else {
 			// Wrap error if it's not already a TaskError
 			if _, ok := err.(*TaskError); !ok {
@@ -575,7 +772,7 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 		}
 	}
 
-	return err, time.Since(startTime).Milliseconds()
+	return err, execTimeMs
 }
 
 // startCompactionWorker starts a background worker that periodically compacts task queues
@@ -639,6 +836,36 @@ func (tm *TaskManagerSimple) compactAllQueues() int {
 	}
 	
 	return totalCompacted
+}
+
+// startAdaptiveTimeoutWorker starts a background worker that periodically decays old timeout statistics
+func (tm *TaskManagerSimple) startAdaptiveTimeoutWorker() {
+	defer tm.wg.Done()
+	
+	// Use ticker to schedule decay at regular intervals (daily)
+	decayInterval := 24 * time.Hour
+	ticker := time.NewTicker(decayInterval)
+	defer ticker.Stop()
+	
+	tm.logger.Info().
+		Msg("[tms|adaptive-timeout] Adaptive timeout worker started")
+	
+	for {
+		select {
+		case <-ticker.C:
+			// Decay old statistics to give more weight to recent task executions
+			if tm.adaptiveTimeout != nil {
+				tm.adaptiveTimeout.DecayOldStats()
+				tm.logger.Debug().Msg("[tms|adaptive-timeout] Decayed old execution statistics")
+			}
+		case <-tm.adaptiveTimeoutStop:
+			tm.logger.Debug().Msg("[tms|adaptive-timeout] Adaptive timeout worker stopping")
+			return
+		case <-tm.shutdownCh:
+			tm.logger.Debug().Msg("[tms|adaptive-timeout] Adaptive timeout worker stopping due to shutdown")
+			return
+		}
+	}
 }
 
 // compactProviderQueue compacts a single provider's task queue
@@ -722,7 +949,7 @@ func InitTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, tasks 
 	// Create a new task manager with all optimizations enabled
 	TaskQueueManagerInstance = NewTaskManagerSimple(providers, servers, logger, getTimeout)
 	TaskQueueManagerInstance.Start()
-	logger.Info().Msg("[tms] Task manager started with all optimizations enabled (memory pooling, task batching, and background compaction)")
+	logger.Info().Msg("[tms] Task manager started with all optimizations enabled (memory pooling, task batching, background compaction, adaptive timeouts, and two-level dispatching)")
 
 	// Signal that the TaskManager is ready
 	taskManagerCond.Broadcast()

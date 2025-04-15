@@ -45,7 +45,7 @@ func (tm *TaskManagerSimple) ExecuteCommand(providerName string, commandFunc fun
 	pd.commandSet[cmdID] = struct{}{}
 	pd.commandSetLock.Unlock()
 
-	// Add the command to the queue
+	// Add the command to the queue under the lock to ensure proper signal
 	pd.taskQueueLock.Lock()
 	pd.commandQueue.Enqueue(Command{
 		id:          cmdID,

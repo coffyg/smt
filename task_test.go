@@ -27,6 +27,7 @@ type MockTask struct {
 	failedTime     int64
 	done           chan struct{}
 	doneOnce       sync.Once
+	callbackName   string // Custom callback name for testing
 }
 
 func (t *MockTask) MarkAsSuccess(time int64) {
@@ -65,6 +66,9 @@ func (t *MockTask) GetTaskGroup() ITaskGroup {
 }
 
 func (t *MockTask) GetCallbackName() string {
+	if t.callbackName != "" {
+		return t.callbackName
+	}
 	return "testCallback"
 }
 func (t *MockTask) GetProvider() IProvider {
