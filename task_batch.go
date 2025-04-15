@@ -20,12 +20,13 @@ type BatchableTask interface {
 // TaskBatch represents a group of tasks that can be processed together
 type TaskBatch struct {
 	tasks       []BatchableTask
-	lock        sync.Mutex
+	lock        sync.Mutex      // protects all fields below
 	batchKey    string
 	createdAt   time.Time
 	maxSize     int
 	maxWaitTime time.Duration
 	timer       *time.Timer
+	processed   bool            // flag to track if batch has been processed
 	processFn   func(batch *TaskBatch)
 	priority    int // Highest priority of any task in the batch
 }
@@ -40,14 +41,51 @@ func NewTaskBatch(initialTask BatchableTask, maxSize int, maxWaitTime time.Durat
 		maxWaitTime: maxWaitTime,
 		processFn:   processFn,
 		priority:    initialTask.GetPriority(),
+		lock:        sync.Mutex{}, // Initialize the mutex explicitly
+		processed:   false,
 	}
 	
+	// Add initial task
 	batch.tasks = append(batch.tasks, initialTask)
 	
-	// Start timer for max wait time
+	// We need to make sure the batch reference is complete before starting the timer
+	// Create a local copy to avoid race conditions with the timer callback
+	timerBatch := batch
+	
+	// Start timer for max wait time in a more thread-safe way
+	batch.lock.Lock()
 	batch.timer = time.AfterFunc(maxWaitTime, func() {
-		batch.Process()
+		// Process the batch via closure capturing the batch reference
+		timerBatch.lock.Lock()
+		
+		// Don't process if already processed
+		if timerBatch.processed {
+			timerBatch.lock.Unlock()
+			return
+		}
+		
+		// Mark as processed
+		timerBatch.processed = true
+		
+		// Stop the timer
+		if timerBatch.timer != nil {
+			timerBatch.timer.Stop()
+			timerBatch.timer = nil
+		}
+		
+		// Get tasks safely before unlocking
+		tasks := timerBatch.tasks
+		processFn := timerBatch.processFn
+		
+		// Unlock before processing to avoid deadlock
+		timerBatch.lock.Unlock()
+		
+		// Process tasks outside of lock if there are any and we have a process function
+		if len(tasks) > 0 && processFn != nil {
+			processFn(timerBatch)
+		}
 	})
+	batch.lock.Unlock()
 	
 	return batch
 }
@@ -59,16 +97,23 @@ func (b *TaskBatch) Add(task BatchableTask) bool {
 	}
 	
 	b.lock.Lock()
-	defer b.lock.Unlock()
+	
+	// Don't add to already processed batches
+	if b.processed {
+		b.lock.Unlock()
+		return false
+	}
 	
 	// Check if batch is full
 	if len(b.tasks) >= b.maxSize {
+		b.lock.Unlock()
 		return false
 	}
 	
 	// Check if any task can't batch with this new task
 	for _, existingTask := range b.tasks {
 		if !existingTask.CanBatchWith(task) {
+			b.lock.Unlock()
 			return false
 		}
 	}
@@ -81,13 +126,35 @@ func (b *TaskBatch) Add(task BatchableTask) bool {
 	// Add task to batch
 	b.tasks = append(b.tasks, task)
 	
-	// Process immediately if batch is full
-	if len(b.tasks) >= b.maxSize {
-		// Stop the timer and process
+	// Check if batch is now full
+	isFull := len(b.tasks) >= b.maxSize
+	
+	if isFull {
+		// Mark as processed before we start processing
+		b.processed = true
+		
+		// Stop the timer
 		if b.timer != nil {
 			b.timer.Stop()
+			b.timer = nil
 		}
-		go b.Process()
+	}
+	
+	// Need local copy for goroutine to avoid race conditions
+	var processFn func(batch *TaskBatch)
+	var batchToProcess *TaskBatch
+	
+	if isFull {
+		processFn = b.processFn
+		batchToProcess = b
+	}
+	
+	// Release lock
+	b.lock.Unlock()
+	
+	// Process in background if batch is full
+	if isFull && processFn != nil {
+		go processFn(batchToProcess)
 	}
 	
 	return true
@@ -95,8 +162,17 @@ func (b *TaskBatch) Add(task BatchableTask) bool {
 
 // Process processes the batch
 func (b *TaskBatch) Process() {
+	// Acquire lock
 	b.lock.Lock()
-	defer b.lock.Unlock()
+	
+	// If already processed, return early
+	if b.processed {
+		b.lock.Unlock()
+		return
+	}
+	
+	// Mark as processed
+	b.processed = true
 	
 	// Stop the timer to avoid calling Process twice
 	if b.timer != nil {
@@ -104,14 +180,21 @@ func (b *TaskBatch) Process() {
 		b.timer = nil
 	}
 	
+	// Copy necessary data before releasing the lock
+	tasks := b.tasks
+	processFn := b.processFn
+	
+	// Release the lock before processing to avoid deadlocks
+	b.lock.Unlock()
+	
 	// Don't process empty batches
-	if len(b.tasks) == 0 {
+	if len(tasks) == 0 {
 		return
 	}
 	
-	// Call the process function
-	if b.processFn != nil {
-		b.processFn(b)
+	// Call the process function outside of the lock
+	if processFn != nil {
+		processFn(b)
 	}
 }
 

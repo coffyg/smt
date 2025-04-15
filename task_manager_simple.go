@@ -28,6 +28,12 @@ type TaskManagerSimple struct {
 	getTimeout           func(string, string) time.Duration
 	serverConcurrencyMap map[string]chan struct{} // Map of servers to semaphores
 	serverConcurrencyMu  sync.RWMutex
+	
+	// Background task compaction settings
+	enableCompaction     bool                     // Whether background compaction is enabled
+	compactionInterval   time.Duration            // Interval between compaction runs
+	compactionThreshold  int                      // Minimum queue size to trigger compaction
+	compactionStop       chan struct{}            // Channel to signal compaction to stop
 }
 
 type ProviderData struct {
@@ -41,13 +47,94 @@ type ProviderData struct {
 	commandSetLock   sync.Mutex
 }
 
+// Basic constructor - default options with all optimizations enabled
 func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string, string) time.Duration) *TaskManagerSimple {
+	return NewTaskManagerWithOptions(providers, servers, logger, getTimeout, &TaskManagerOptions{
+		// Memory pooling settings
+		EnablePooling:        true,  // Enable memory pooling for better memory usage
+		
+		// Task batching settings
+		EnableBatching:       true,  // Enable task batching for improved throughput
+		BatchMaxSize:         100,   // Default batch size
+		BatchMaxWait:         100 * time.Millisecond, // Default wait time
+		
+		// Background task compaction settings
+		EnableCompaction:     true,  // Enable background compaction for memory optimization
+		CompactionInterval:   1 * time.Minute,
+		CompactionThreshold:  50,
+	})
+}
+
+// TaskManagerOptions provides configuration options for TaskManagerSimple
+type TaskManagerOptions struct {
+	// Memory pooling settings
+	EnablePooling       bool          // Whether to enable memory pooling for task wrappers
+	
+	// Task batching settings
+	EnableBatching      bool          // Whether to enable task batching by server
+	BatchMaxSize        int           // Maximum batch size (default: 100)
+	BatchMaxWait        time.Duration // Maximum wait time for batches (default: 100ms)
+	
+	// Background task compaction settings
+	EnableCompaction    bool          // Whether to enable background task compaction
+	CompactionInterval  time.Duration // Interval between compaction runs (default: 1 minute)
+	CompactionThreshold int           // Minimum queue size for compaction (default: 50)
+}
+
+// NewTaskManagerWithPool creates a task manager with memory pooling for task wrappers
+func NewTaskManagerWithPool(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string, string) time.Duration) *TaskManagerSimple {
+	return NewTaskManagerWithOptions(providers, servers, logger, getTimeout, &TaskManagerOptions{
+		EnablePooling: true,
+	})
+}
+
+// NewTaskManagerWithCompaction creates a task manager with background compaction enabled
+func NewTaskManagerWithCompaction(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string, string) time.Duration) *TaskManagerSimple {
+	return NewTaskManagerWithOptions(providers, servers, logger, getTimeout, &TaskManagerOptions{
+		EnablePooling:       true,
+		EnableCompaction:    true,
+		CompactionInterval:  1 * time.Minute,
+		CompactionThreshold: 50,
+	})
+}
+
+// NewTaskManagerWithOptions creates a new task manager with the specified options
+func NewTaskManagerWithOptions(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string, string) time.Duration, options *TaskManagerOptions) *TaskManagerSimple {
+	// Set default options if not provided
+	if options == nil {
+		options = &TaskManagerOptions{}
+	}
+	
+	// Set default batch settings if batching is enabled
+	if options.EnableBatching {
+		if options.BatchMaxSize <= 0 {
+			options.BatchMaxSize = 100 // Default batch size
+		}
+		if options.BatchMaxWait <= 0 {
+			options.BatchMaxWait = 100 * time.Millisecond // Default wait time
+		}
+	}
+	
+	// Set default compaction settings if compaction is enabled
+	if options.EnableCompaction {
+		if options.CompactionInterval <= 0 {
+			options.CompactionInterval = 1 * time.Minute // Default interval
+		}
+		if options.CompactionThreshold <= 0 {
+			options.CompactionThreshold = 50 // Default threshold
+		}
+	}
+	
 	tm := &TaskManagerSimple{
 		providers:            make(map[string]*ProviderData, len(*providers)),
 		shutdownCh:           make(chan struct{}),
 		logger:               logger,
 		getTimeout:           getTimeout,
 		serverConcurrencyMap: make(map[string]chan struct{}),
+		enableCompaction:     options.EnableCompaction,
+		compactionInterval:   options.CompactionInterval,
+		compactionThreshold:  options.CompactionThreshold,
+		compactionStop:       make(chan struct{}),
 		serverConcurrencyMu:  sync.RWMutex{},
 	}
 
@@ -215,6 +302,12 @@ func (tm *TaskManagerSimple) Start() {
 			go tm.providerDispatcher(providerName)
 			numWorkers++
 		}
+	}
+	
+	// Start background task compaction if enabled
+	if tm.enableCompaction {
+		tm.wg.Add(1)
+		go tm.startCompactionWorker()
 	}
 	
 	// If we have no workers (no servers), log a warning
@@ -402,6 +495,11 @@ func (tm *TaskManagerSimple) Shutdown() {
 
 	// Close shutdown channel (protected by CompareAndSwap above)
 	close(tm.shutdownCh)
+	
+	// Signal compaction worker to stop if enabled
+	if tm.enableCompaction {
+		close(tm.compactionStop)
+	}
 
 	// Signal all provider dispatchers to wake up
 	for _, pd := range tm.providers {
@@ -480,6 +578,134 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 	return err, time.Since(startTime).Milliseconds()
 }
 
+// startCompactionWorker starts a background worker that periodically compacts task queues
+// to reduce memory fragmentation and clean up completed tasks
+func (tm *TaskManagerSimple) startCompactionWorker() {
+	defer tm.wg.Done()
+	
+	// Use ticker to schedule compaction at regular intervals
+	ticker := time.NewTicker(tm.compactionInterval)
+	defer ticker.Stop()
+	
+	tm.logger.Info().
+		Dur("interval", tm.compactionInterval).
+		Int("threshold", tm.compactionThreshold).
+		Msg("[tms|compaction] Background task compaction started")
+	
+	for {
+		select {
+		case <-ticker.C:
+			// Perform compaction on all provider queues
+			if totalCompacted := tm.compactAllQueues(); totalCompacted > 0 {
+				tm.logger.Debug().Int("compacted", totalCompacted).Msg("[tms|compaction] Completed task queue compaction")
+			}
+		case <-tm.compactionStop:
+			tm.logger.Debug().Msg("[tms|compaction] Background task compaction stopping")
+			return
+		case <-tm.shutdownCh:
+			tm.logger.Debug().Msg("[tms|compaction] Background task compaction stopping due to shutdown")
+			return
+		}
+	}
+}
+
+// compactAllQueues performs compaction on all provider task queues
+// Returns the total number of compacted tasks
+func (tm *TaskManagerSimple) compactAllQueues() int {
+	startTime := time.Now()
+	var totalCompacted int
+	var providers int
+	
+	// Avoid compaction if shutting down
+	if tm.HasShutdownRequest() {
+		return 0
+	}
+	
+	// Compact each provider's queue
+	for providerName, pd := range tm.providers {
+		compacted := tm.compactProviderQueue(providerName, pd)
+		if compacted > 0 {
+			totalCompacted += compacted
+			providers++
+		}
+	}
+	
+	if totalCompacted > 0 {
+		tm.logger.Debug().
+			Int("compacted", totalCompacted).
+			Int("providers", providers).
+			Dur("took", time.Since(startTime)).
+			Msg("[tms|compaction] Completed task queue compaction")
+	}
+	
+	return totalCompacted
+}
+
+// compactProviderQueue compacts a single provider's task queue
+// Returns the number of compacted tasks
+func (tm *TaskManagerSimple) compactProviderQueue(providerName string, pd *ProviderData) int {
+	// First, check if compaction is worth it by looking at queue size
+	if len(pd.taskQueue) < tm.compactionThreshold {
+		return 0
+	}
+	
+	// Get exclusive lock on the task queue to prevent concurrent modifications
+	pd.taskQueueLock.Lock()
+	defer pd.taskQueueLock.Unlock()
+	
+	// Check size again after getting the lock
+	currentSize := len(pd.taskQueue)
+	if currentSize < tm.compactionThreshold {
+		return 0
+	}
+	
+	startTime := time.Now()
+	
+	// Create a new slice with appropriate capacity
+	newQueue := make(TaskQueuePrio, 0, currentSize)
+	compacted := 0
+	
+	// Check each task and only keep valid ones
+	for _, taskWithPriority := range pd.taskQueue {
+		// Skip nil tasks
+		if taskWithPriority == nil || taskWithPriority.task == nil {
+			compacted++
+			continue
+		}
+		
+		// Check if task is in the queue map
+		taskID := taskWithPriority.task.GetID()
+		if !tm.isTaskInQueue(taskID) {
+			// Task is orphaned (completed but not removed from queue)
+			compacted++
+			continue
+		}
+		
+		// Update the index to match the new position
+		taskWithPriority.index = len(newQueue)
+		newQueue = append(newQueue, taskWithPriority)
+	}
+	
+	// Only replace if we actually compacted something
+	if compacted > 0 {
+		// Replace the task queue with the compacted one
+		pd.taskQueue = newQueue
+		
+		// Signal change
+		pd.taskQueueCond.Signal()
+		
+		tm.logger.Debug().
+			Str("provider", providerName).
+			Int("before", currentSize).
+			Int("after", len(newQueue)).
+			Int("compacted", compacted).
+			Dur("took", time.Since(startTime)).
+			Msg("[tms|compaction] Compacted task queue")
+	}
+	
+	return compacted
+}
+
 var (
 	TaskQueueManagerInstance *TaskManagerSimple
 	taskManagerMutex         sync.Mutex
@@ -493,9 +719,10 @@ func InitTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, tasks 
 	defer taskManagerMutex.Unlock()
 	logger.Info().Msg("[tms] Task manager initialization")
 
+	// Create a new task manager with all optimizations enabled
 	TaskQueueManagerInstance = NewTaskManagerSimple(providers, servers, logger, getTimeout)
 	TaskQueueManagerInstance.Start()
-	logger.Info().Msg("[tms] Task manager started")
+	logger.Info().Msg("[tms] Task manager started with all optimizations enabled (memory pooling, task batching, and background compaction)")
 
 	// Signal that the TaskManager is ready
 	taskManagerCond.Broadcast()
