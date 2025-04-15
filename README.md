@@ -10,12 +10,13 @@ A Go library for task queue management with high performance optimizations.
 - Memory pooling for task objects
 - Task batching for improved throughput
 - Background task compaction for memory optimization
+- Adaptive timeouts for optimal performance
 - Thread-safe operation with proper synchronization
 
 ## Usage
 
 ```go
-// Create a task manager with default options (memory pooling and compaction enabled)
+// Create a task manager with default options (all optimizations enabled)
 tm := NewTaskManagerSimple(&providers, servers, &logger, timeoutFunc)
 
 // Start the task manager
@@ -46,6 +47,9 @@ tm := NewTaskManagerWithOptions(&providers, servers, &logger, timeoutFunc, &Task
     EnableCompaction: true,
     CompactionInterval: 1 * time.Minute,
     CompactionThreshold: 50,
+    
+    // Adaptive timeout settings
+    EnableAdaptiveTimeout: true,
 })
 ```
 
@@ -55,3 +59,4 @@ See detailed information about the optimizations in:
 - [MEMORY_POOL_SUMMARY.md](MEMORY_POOL_SUMMARY.md)
 - [COMPACTION_SUMMARY.md](COMPACTION_SUMMARY.md)
 - [BATCH_PERFORMANCE.md](BATCH_PERFORMANCE.md)
+- [ADAPTIVE_TIMEOUT_SUMMARY.md](ADAPTIVE_TIMEOUT_SUMMARY.md)
