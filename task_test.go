@@ -88,6 +88,7 @@ func (t *MockTask) UpdateLastError(errStr string) error {
 func (t *MockTask) OnComplete() {
 	t.completeCalled = true
 	if t.done != nil {
+		// Use sync.Once to safely close the channel only once
 		t.doneOnce.Do(func() {
 			close(t.done)
 		})

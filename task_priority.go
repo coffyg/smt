@@ -44,10 +44,10 @@ func (tq *TaskQueuePrio) Push(x interface{}) {
 	// Preallocate when growing near capacity
 	capNeeded := cap(*tq)
 	if n >= capNeeded {
-		// Grow to at least 1.5x (better than Go default 2x for this use case)
-		newCap := capNeeded*3/2 + 1
+		// Grow to 1.5x (better than Go default 2x for most use cases)
+		newCap := capNeeded*3/2 + 4
 		if capNeeded == 0 {
-			newCap = 8 // Start with 8 for very small queues
+			newCap = 16 // Start with 16 for very small queues
 		}
 		// Create new slice with increased capacity
 		newSlice := make([]*TaskWithPriority, n, newCap)
@@ -65,9 +65,8 @@ func (tq *TaskQueuePrio) Pop() interface{} {
 	old := *tq
 	n := len(old)
 	item := old[n-1]
+	old[n-1] = nil // For safety and GC
 	item.index = -1 // For safety
-	// Clear pointer to help GC for large objects
-	old[n-1] = nil
 	*tq = old[0 : n-1]
 	return item
 }
@@ -78,4 +77,13 @@ func (tq *TaskQueuePrio) Update(item *TaskWithPriority, priority int) {
 	item.priority = priority
 	// After changing the priority, we need to restore the heap property
 	heap.Fix(tq, item.index)
+}
+
+// PeekHighestPriority returns the highest priority task without removing it
+// This is a constant-time operation since the heap keeps highest priority at index 0
+func (tq *TaskQueuePrio) PeekHighestPriority() (ITask, bool) {
+	if len(*tq) == 0 {
+		return nil, false
+	}
+	return (*tq)[0].task, true
 }

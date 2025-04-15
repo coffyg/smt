@@ -59,3 +59,6 @@ glide.lock
 # Temporary files
 *.session
 tags
+PERFORMANCE_SUMMARY.md
+OPTIMIZATION_SUMMARY.md
+test_output.txt

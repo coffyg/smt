@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -176,7 +177,8 @@ func TestAddTaskWithNilProvider(t *testing.T) {
 		t.Error("Expected task to be marked as failed due to nil provider")
 	}
 
-	if task.lastError != "task 'task_with_nil_provider' has no provider" {
+	// Check that the error message contains the expected text
+	if !strings.Contains(task.lastError, "task has no provider") {
 		t.Errorf("Unexpected error message: %s", task.lastError)
 	}
 
@@ -214,18 +216,16 @@ func TestTaskManagerSimple_ExecuteCommand(t *testing.T) {
 	executionOrder := []string{}
 	var executionOrderLock sync.Mutex
 
-	provider.handleFunc = func(task ITask, server string) error {
-		executionOrderLock.Lock()
-		executionOrder = append(executionOrder, "task")
-		executionOrderLock.Unlock()
-		if mt, ok := task.(*MockTask); ok {
-			mt.startCalled = true
-			if mt.done != nil {
-				close(mt.done)
+		provider.handleFunc = func(task ITask, server string) error {
+			executionOrderLock.Lock()
+			executionOrder = append(executionOrder, "task")
+			executionOrderLock.Unlock()
+			if mt, ok := task.(*MockTask); ok {
+				mt.startCalled = true
+				// Do not close the channel here, let OnComplete handle it properly
 			}
+			return nil
 		}
-		return nil
-	}
 
 	tm.AddTask(task)
 

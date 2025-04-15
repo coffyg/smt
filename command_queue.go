@@ -11,16 +11,16 @@ type ringBuffer struct {
 	size      int
 	head      int
 	tail      int
-	count     int32 // Using atomic operations for faster concurrent access
+	count     atomic.Int32 // Using atomic for thread-safe concurrent access
 	capacity  int
 }
 
 // CommandQueue is a thread-safe FIFO queue for Commands using a ring buffer
 type CommandQueue struct {
-	rb       *ringBuffer
-	lock     sync.Mutex
+	rb   *ringBuffer
+	lock sync.Mutex
 	// Cache padding to prevent false sharing
-	_        [64]byte
+	_    [64]byte
 }
 
 // newRingBuffer creates a new ring buffer with the given capacity
@@ -34,7 +34,6 @@ func newRingBuffer(capacity int) *ringBuffer {
 		size:     0,
 		head:     0,
 		tail:     0,
-		count:    0,
 		capacity: capacity,
 	}
 }
@@ -44,15 +43,16 @@ func (rb *ringBuffer) resize() {
 	newCapacity := rb.capacity * 2
 	newBuffer := make([]Command, newCapacity)
 	
+	count := rb.count.Load()
 	// Copy existing items in order
-	for i := 0; i < int(rb.count); i++ {
+	for i := 0; i < int(count); i++ {
 		newBuffer[i] = rb.buffer[(rb.head+i)%rb.capacity]
 	}
 	
 	// Update buffer and indices
 	rb.buffer = newBuffer
 	rb.head = 0
-	rb.tail = int(rb.count)
+	rb.tail = int(count)
 	rb.capacity = newCapacity
 }
 
@@ -66,17 +66,18 @@ func NewCommandQueue(initialCapacity int) *CommandQueue {
 // Enqueue adds a command to the queue
 func (cq *CommandQueue) Enqueue(cmd Command) {
 	cq.lock.Lock()
-	defer cq.lock.Unlock()
 	
 	// Check if buffer is full and resize if needed
-	if int(cq.rb.count) == cq.rb.capacity {
+	if cq.rb.count.Load() == int32(cq.rb.capacity) {
 		cq.rb.resize()
 	}
 	
 	// Add item to tail
 	cq.rb.buffer[cq.rb.tail] = cmd
 	cq.rb.tail = (cq.rb.tail + 1) % cq.rb.capacity
-	atomic.AddInt32(&cq.rb.count, 1)
+	cq.rb.count.Add(1)
+	
+	cq.lock.Unlock()
 }
 
 // Dequeue removes and returns the oldest command from the queue
@@ -85,7 +86,7 @@ func (cq *CommandQueue) Dequeue() (Command, bool) {
 	defer cq.lock.Unlock()
 	
 	// Check if buffer is empty
-	if atomic.LoadInt32(&cq.rb.count) == 0 {
+	if cq.rb.count.Load() == 0 {
 		return Command{}, false
 	}
 	
@@ -94,7 +95,7 @@ func (cq *CommandQueue) Dequeue() (Command, bool) {
 	// Clear reference to help GC
 	cq.rb.buffer[cq.rb.head] = Command{}
 	cq.rb.head = (cq.rb.head + 1) % cq.rb.capacity
-	atomic.AddInt32(&cq.rb.count, -1)
+	cq.rb.count.Add(-1)
 	
 	return cmd, true
 }
@@ -102,5 +103,5 @@ func (cq *CommandQueue) Dequeue() (Command, bool) {
 // Len returns the number of commands in the queue
 func (cq *CommandQueue) Len() int {
 	// Use atomic access for better concurrency
-	return int(atomic.LoadInt32(&cq.rb.count))
+	return int(cq.rb.count.Load())
 }
