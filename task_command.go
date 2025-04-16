@@ -1,7 +1,6 @@
 package smt
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"runtime"
@@ -105,11 +104,19 @@ func (tm *TaskManagerSimple) HandleCommandWithTimeout(providerName string, comma
 
 	// Use the provider's default timeout
 	maxTimeout := tm.getTimeout("", providerName)
-	ctx, cancel := context.WithTimeout(context.Background(), maxTimeout)
-	defer cancel()
+	
+	// Get pre-allocated channel from the pool
+	done := doneChPool.Get().(chan error)
+	defer doneChPool.Put(done)
+	
+	// Clear any potential previous values from the channel
+	select {
+	case <-done:
+		// Drain the channel if it had a value
+	default:
+		// Channel is already empty
+	}
 
-	// Use buffered channel to avoid goroutine leaks
-	done := make(chan error, 1)
 	startTime := time.Now()
 	cmdID := command.id
 
@@ -127,8 +134,12 @@ func (tm *TaskManagerSimple) HandleCommandWithTimeout(providerName string, comma
 		done <- command.commandFunc(server)
 	}()
 
+	// Use timer instead of context for timeout
+	timer := time.NewTimer(maxTimeout)
+	defer timer.Stop()
+
 	select {
-	case <-ctx.Done():
+	case <-timer.C:
 		err = newTaskError("HandleCommandWithTimeout", cmdID.String(), providerName, server, ErrCommandTimeout)
 		tm.logger.Error().Err(err).Msgf("[%s|command|%s] Command FAILED-TIMEOUT on server %s, took %s", providerName, cmdID, server, time.Since(startTime))
 	case err = <-done:

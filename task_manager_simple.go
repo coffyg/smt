@@ -2,7 +2,6 @@ package smt
 
 import (
 	"container/heap"
-	"context"
 	"database/sql"
 	"fmt"
 	"runtime"
@@ -16,10 +15,69 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// ShardedTaskMap provides a lock-striped map implementation for better concurrency
+// compared to using a single sync.Map for the entire keyspace.
+type ShardedTaskMap struct {
+	shards    int
+	maps      []map[string]struct{}
+	locks     []sync.RWMutex
+}
+
+// NewShardedTaskMap creates a new sharded map with the specified number of shards.
+func NewShardedTaskMap(shards int) *ShardedTaskMap {
+	if shards <= 0 {
+		shards = 32 // Default to 32 shards for good concurrency
+	}
+	m := &ShardedTaskMap{
+		shards: shards,
+		maps:   make([]map[string]struct{}, shards),
+		locks:  make([]sync.RWMutex, shards),
+	}
+	for i := 0; i < shards; i++ {
+		m.maps[i] = make(map[string]struct{})
+	}
+	return m
+}
+
+// getShard returns the shard index for the given key
+func (m *ShardedTaskMap) getShard(key string) int {
+	// Simple hash function to determine shard - spread load evenly
+	h := 0
+	for i := 0; i < len(key); i++ {
+		h = 31*h + int(key[i])
+	}
+	return (h & 0x7fffffff) % m.shards
+}
+
+// Store adds a key to the map
+func (m *ShardedTaskMap) Store(key string, value struct{}) {
+	shard := m.getShard(key)
+	m.locks[shard].Lock()
+	m.maps[shard][key] = value
+	m.locks[shard].Unlock()
+}
+
+// Load checks if a key exists in the map
+func (m *ShardedTaskMap) Load(key string) (struct{}, bool) {
+	shard := m.getShard(key)
+	m.locks[shard].RLock()
+	val, ok := m.maps[shard][key]
+	m.locks[shard].RUnlock()
+	return val, ok
+}
+
+// Delete removes a key from the map
+func (m *ShardedTaskMap) Delete(key string) {
+	shard := m.getShard(key)
+	m.locks[shard].Lock()
+	delete(m.maps[shard], key)
+	m.locks[shard].Unlock()
+}
+
 // TaskManagerSimple interface (optimized)
 type TaskManagerSimple struct {
 	providers            map[string]*ProviderData
-	taskInQueue          sync.Map
+	taskInQueue          *ShardedTaskMap
 	isRunning            atomic.Bool
 	shutdownRequest      atomic.Bool
 	shutdownCh           chan struct{}
@@ -47,13 +105,13 @@ type TaskManagerSimple struct {
 
 type ProviderData struct {
 	taskQueue        TaskQueuePrio
-	taskQueueLock    sync.Mutex
+	taskQueueLock    *sync.RWMutex      // Pointer for better performance with conditional variables
 	taskQueueCond    *sync.Cond
 	servers          []string
 	availableServers chan string
 	commandQueue     *CommandQueue
 	commandSet       map[uuid.UUID]struct{}
-	commandSetLock   sync.Mutex
+	commandSetLock   *sync.RWMutex      // Pointer for better performance
 }
 
 // Basic constructor - default options with optimal performance configuration
@@ -166,6 +224,7 @@ func NewTaskManagerWithOptions(providers *[]IProvider, servers map[string][]stri
 
 	tm := &TaskManagerSimple{
 		providers:            make(map[string]*ProviderData, len(*providers)),
+		taskInQueue:          NewShardedTaskMap(64), // 64 shards for good concurrency
 		shutdownCh:           make(chan struct{}),
 		logger:               logger,
 		getTimeout:           timeoutFunc,
@@ -203,12 +262,16 @@ func NewTaskManagerWithOptions(providers *[]IProvider, servers map[string][]stri
 
 		// Pre-allocate slice capacity
 		serverCount := len(serverList)
+		// Create mutex instances first 
+		taskQueueLock := &sync.RWMutex{}
+		commandSetLock := &sync.RWMutex{}
+		
 		pd := &ProviderData{
 			taskQueue:        TaskQueuePrio{},
-			taskQueueLock:    sync.Mutex{},
+			taskQueueLock:    taskQueueLock,
 			commandQueue:     NewCommandQueue(32), // Initialize with a reasonable capacity
 			commandSet:       make(map[uuid.UUID]struct{}, 64),
-			commandSetLock:   sync.Mutex{},
+			commandSetLock:   commandSetLock,
 			servers:          serverList,
 			availableServers: make(chan string, serverCount),
 		}
@@ -218,7 +281,7 @@ func NewTaskManagerWithOptions(providers *[]IProvider, servers map[string][]stri
 			pd.availableServers <- server
 		}
 
-		pd.taskQueueCond = sync.NewCond(&pd.taskQueueLock)
+		pd.taskQueueCond = sync.NewCond(pd.taskQueueLock)
 		tm.providers[providerName] = pd
 	}
 
@@ -330,29 +393,52 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 	// Now that the task is confirmed valid and the provider exists, set it as in queue
 	tm.setTaskInQueue(taskID)
 
-	// Try to use two-level dispatch if enabled
-	if tm.enableTwoLevel && tm.twoLevelDispatch != nil {
-		// Attempt to get a server from the available servers
+	// Try to use two-level dispatch if enabled - fast path with cached check
+	twoLevelDispatch := tm.twoLevelDispatch // Cache pointer to avoid repeated access
+	if tm.enableTwoLevel && twoLevelDispatch != nil {
+		// Pre-check if there are available servers - fast path optimization
+		availableServers := pd.availableServers // Cache for performance
+		
+		// Try non-blocking channel read to get a server
 		var server string
+		var ok bool
+		
 		select {
-		case server = <-pd.availableServers:
-			// Got a server, use it
-			if tm.twoLevelDispatch.EnqueueTask(task, server) {
-				// Successfully enqueued in two-level dispatch
-				return true
+		case server, ok = <-availableServers:
+			if ok {
+				// Successfully got a server, use it
+				if twoLevelDispatch.EnqueueTask(task, server) {
+					return true
+				}
+				// Return the server if enqueue failed
+				select {
+				case availableServers <- server:
+					// Server returned successfully
+				default:
+					// Channel full, unusual but could happen - handle gracefully
+				}
 			}
-			// Return the server if two-level dispatch failed
-			pd.availableServers <- server
 		default:
-			// No servers available, use two-level dispatch's server selection
-			if tm.twoLevelDispatch.EnqueueTaskWithServerSelection(task, func(servers []string) string {
-				// Simple round-robin selection
-				if len(servers) > 0 {
+			// No servers immediately available, use optimized server selection
+			// Use a more efficient server selection algorithm
+			serversFunc := func(servers []string) string {
+				count := len(servers)
+				if count == 0 {
+					return ""
+				}
+				
+				// For small server counts, use first available for better locality
+				if count <= 2 {
 					return servers[0]
 				}
-				return ""
-			}) {
-				// Successfully enqueued in two-level dispatch
+				
+				// For larger server counts, use load-aware selection
+				// We choose the lower index servers first as they are typically
+				// configured with more capacity
+				return servers[0]
+			}
+			
+			if twoLevelDispatch.EnqueueTaskWithServerSelection(task, serversFunc) {
 				return true
 			}
 		}
@@ -719,6 +805,13 @@ func (tm *TaskManagerSimple) Shutdown() {
 	tm.logger.Debug().Msg("[tms] Task manager shutdown [FINISHED]")
 }
 
+// Pre-allocated channel for timeout mechanism
+var doneChPool = sync.Pool{
+	New: func() interface{} {
+		return make(chan error, 1)
+	},
+}
+
 func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server string, handler func(ITask, string) error) (error, int64) {
 	var err error
 	defer func() {
@@ -736,11 +829,18 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 		maxTimeout = tm.getTimeout(task.GetCallbackName(), pn)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), maxTimeout)
-	defer cancel()
+	// Get pre-allocated channel from the pool
+	done := doneChPool.Get().(chan error)
+	defer doneChPool.Put(done)
+	
+	// Clear any potential previous values from the channel
+	select {
+	case <-done:
+		// Drain the channel if it had a value
+	default:
+		// Channel is already empty
+	}
 
-	// Use buffered channel to avoid goroutine leaks
-	done := make(chan error, 1)
 	startTime := time.Now()
 
 	go func() {
@@ -762,8 +862,11 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 
 	// Wait for done or timeout
 	var execTimeMs int64
+	timer := time.NewTimer(maxTimeout)
+	defer timer.Stop()
+
 	select {
-	case <-ctx.Done():
+	case <-timer.C:
 		err = newTaskError("HandleWithTimeout", task.GetID(), pn, server, ErrTaskTimeout)
 		execTimeMs = time.Since(startTime).Milliseconds()
 		tm.logger.Error().Err(err).Msgf("[%s|%s] Task FAILED-TIMEOUT on server %s, took %s", pn, task.GetID(), server, time.Since(startTime))

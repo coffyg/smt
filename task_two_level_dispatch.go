@@ -10,7 +10,7 @@ import (
 type ServerDispatcher struct {
 	server            string
 	taskQueue         TaskQueuePrio
-	taskQueueLock     sync.Mutex
+	taskQueueLock     *sync.RWMutex  // Pointer for better performance with conditional variables
 	taskQueueCond     *sync.Cond
 	workerCount       int
 	maxWorkers        int
@@ -56,13 +56,17 @@ func (pd *ProviderDispatcher) GetOrCreateServerDispatcher(server string, maxWork
 		return sd
 	}
 	
+	// Create mutex for the task queue
+	taskQueueLock := &sync.RWMutex{}
+	
 	sd = &ServerDispatcher{
-		server:     server,
-		taskQueue:  TaskQueuePrio{},
-		maxWorkers: maxWorkers,
-		parent:     pd,
+		server:        server,
+		taskQueue:     TaskQueuePrio{},
+		taskQueueLock: taskQueueLock,
+		maxWorkers:    maxWorkers,
+		parent:        pd,
 	}
-	sd.taskQueueCond = sync.NewCond(&sd.taskQueueLock)
+	sd.taskQueueCond = sync.NewCond(taskQueueLock)
 	pd.servers[server] = sd
 	
 	// Start the server dispatcher
@@ -80,22 +84,49 @@ func (pd *ProviderDispatcher) EnqueueTask(task ITask, server string) {
 	sd.EnqueueTask(task)
 }
 
-// EnqueueTaskToAll enqueues a task to all servers
+// EnqueueTaskToAll enqueues a task to all servers with optimized server collection
 func (pd *ProviderDispatcher) EnqueueTaskToAll(task ITask, selectServer func([]string) string) {
-	// Get list of all servers
+	// Get list of all servers with shutdown check - this prevents race conditions
 	pd.serverLock.RLock()
-	serverList := make([]string, 0, len(pd.servers))
+	
+	// Check shutdown status while holding the lock
+	if pd.isShutdown {
+		pd.serverLock.RUnlock()
+		return
+	}
+	
+	serverCount := len(pd.servers)
+	
+	// Fast path for common case of no servers
+	if serverCount == 0 {
+		pd.serverLock.RUnlock()
+		return
+	}
+	
+	// Fast path for single server case
+	if serverCount == 1 {
+		// With only one server, we can directly get it without allocating a slice
+		var serverName string
+		for name := range pd.servers {
+			serverName = name
+			break
+		}
+		pd.serverLock.RUnlock()
+		
+		if serverName != "" {
+			pd.EnqueueTask(task, serverName)
+		}
+		return
+	}
+	
+	// Pre-allocate serverList with exact capacity
+	serverList := make([]string, 0, serverCount)
 	for serverName := range pd.servers {
 		serverList = append(serverList, serverName)
 	}
 	pd.serverLock.RUnlock()
 	
-	// If no servers, return
-	if len(serverList) == 0 {
-		return
-	}
-	
-	// Select a server and enqueue
+	// Select a server and enqueue - already checked if empty above
 	server := selectServer(serverList)
 	if server != "" {
 		pd.EnqueueTask(task, server)
@@ -104,12 +135,18 @@ func (pd *ProviderDispatcher) EnqueueTaskToAll(task ITask, selectServer func([]s
 
 // Shutdown shuts down all server dispatchers
 func (pd *ProviderDispatcher) Shutdown() {
+	pd.serverLock.Lock()
 	pd.isShutdown = true
 	
-	pd.serverLock.RLock()
-	defer pd.serverLock.RUnlock()
-	
+	// Create a copy of server dispatchers to shutdown while holding the lock
+	servers := make([]*ServerDispatcher, 0, len(pd.servers))
 	for _, sd := range pd.servers {
+		servers = append(servers, sd)
+	}
+	pd.serverLock.Unlock()
+	
+	// Shutdown each server dispatcher without holding the lock
+	for _, sd := range servers {
 		sd.Shutdown()
 	}
 }
@@ -117,25 +154,33 @@ func (pd *ProviderDispatcher) Shutdown() {
 // EnqueueTask adds a task to the server's queue
 func (sd *ServerDispatcher) EnqueueTask(task ITask) {
 	sd.taskQueueLock.Lock()
-	defer sd.taskQueueLock.Unlock()
 	
-	// Check shutdown status while holding the lock
+	// Check shutdown status while holding the lock - early exit
 	if sd.isShutdown {
+		sd.taskQueueLock.Unlock()
 		return
+	}
+	
+	// Get task pool once to avoid repeated nil checks and property access
+	var taskPool *TaskWithPriorityPool
+	if tm := sd.parent.taskManager; tm != nil && tm.enablePooling {
+		taskPool = tm.taskPool
 	}
 	
 	// Use the parent's task pool if available to avoid memory allocation
 	var taskWithPriority *TaskWithPriority
-	if tm := sd.parent.taskManager; tm != nil && tm.enablePooling && tm.taskPool != nil {
-		taskWithPriority = tm.taskPool.GetWithTask(task, task.GetPriority())
+	if taskPool != nil {
+		taskWithPriority = taskPool.GetWithTask(task, task.GetPriority())
 	} else {
 		taskWithPriority = &TaskWithPriority{
 			task:     task,
 			priority: task.GetPriority(),
 		}
 	}
+	
 	heap.Push(&sd.taskQueue, taskWithPriority)
 	sd.taskQueueCond.Signal()
+	sd.taskQueueLock.Unlock()
 }
 
 // Start starts the server dispatcher
@@ -162,50 +207,58 @@ func (sd *ServerDispatcher) startWorker() {
 		defer sd.wg.Done()
 		defer sd.decrementWorkerCount()
 		
+		// Get references to frequently used objects upfront
+		// to minimize indirect access and pointer chasing in the loop
+		taskQueue := &sd.taskQueue
+		taskQueueCond := sd.taskQueueCond
+		var tm *TaskManagerSimple
+		if sd.parent != nil {
+			tm = sd.parent.taskManager
+		}
+		providerName := sd.parent.providerName
+		server := sd.server
+		
 		for {
 			// Get a task from the queue or wait
 			sd.taskQueueLock.Lock()
 			
-			// Wait for tasks or shutdown
-			for sd.taskQueue.Len() == 0 && !sd.isShutdown {
-				sd.taskQueueCond.Wait()
+			// Wait for tasks or shutdown - use fast path 
+			if taskQueue.Len() == 0 && !sd.isShutdown {
+				taskQueueCond.Wait()
 			}
 			
-			// Check for shutdown
+			// Check for shutdown - fast exit path
 			if sd.isShutdown {
 				sd.taskQueueLock.Unlock()
 				return
 			}
 			
-			// Check if queue is still empty
-			if sd.taskQueue.Len() == 0 {
+			// Check if queue is still empty - rare condition but needs to be handled
+			if taskQueue.Len() == 0 {
 				sd.taskQueueLock.Unlock()
-				
-				// Sleep briefly to avoid spinning
-				time.Sleep(10 * time.Millisecond)
+				time.Sleep(5 * time.Millisecond) // Reduced sleep time for better responsiveness
 				continue
 			}
 			
-			// Get the next task
-			taskWithPriority := heap.Pop(&sd.taskQueue).(*TaskWithPriority)
+			// Determine if we should start a new worker before popping the task
+			shouldStartNewWorker := taskQueue.Len() > 1 && sd.workerCount < sd.maxWorkers
 			
-			// Check if we need more workers
-			shouldStartNewWorker := sd.taskQueue.Len() > 0 && sd.workerCount < sd.maxWorkers
+			// Get the next task
+			taskWithPriority := heap.Pop(taskQueue).(*TaskWithPriority)
 			
 			// Release the lock before processing
 			sd.taskQueueLock.Unlock()
 			
-			// Start a new worker if needed
+			// Start a new worker if needed - do this in parallel with processing
 			if shouldStartNewWorker {
-				sd.startWorker()
+				go sd.startWorker() // Start in separate goroutine to not block processing
 			}
 			
-			// Process the task
+			// Process the task - using cached values from above
 			task := taskWithPriority.task
-			tm := sd.parent.taskManager
-			
-			// Process the task
-			tm.processTaskTwoLevel(task, sd.parent.providerName, sd.server, taskWithPriority)
+			if tm != nil {
+				tm.processTaskTwoLevel(task, providerName, server, taskWithPriority)
+			}
 		}
 	}()
 }

@@ -1,7 +1,6 @@
 package smt
 
 import (
-	"runtime"
 	"sync"
 	"sync/atomic"
 )
@@ -41,7 +40,7 @@ func NewTaskWithPriorityPoolConfig(config *PoolConfig) *TaskWithPriorityPool {
 	// Use default config if none provided
 	if config == nil {
 		config = &PoolConfig{
-			PreWarmSize:  1000,
+			PreWarmSize:  2000,
 			TrackStats:   false,
 			PreWarmAsync: true,
 		}
@@ -49,7 +48,7 @@ func NewTaskWithPriorityPoolConfig(config *PoolConfig) *TaskWithPriorityPool {
 
 	// Ensure sensible defaults
 	if config.PreWarmSize <= 0 {
-		config.PreWarmSize = 1000
+		config.PreWarmSize = 2000
 	}
 
 	pool := &TaskWithPriorityPool{
@@ -60,6 +59,7 @@ func NewTaskWithPriorityPoolConfig(config *PoolConfig) *TaskWithPriorityPool {
 					priority: 0,
 					index:    -1,
 					task:     nil,
+					sortKey:  0,
 				}
 			},
 		},
@@ -80,24 +80,29 @@ func NewTaskWithPriorityPoolConfig(config *PoolConfig) *TaskWithPriorityPool {
 // initial allocation pressure.
 func (p *TaskWithPriorityPool) preWarm() {
 	p.preWarmThread.Do(func() {
-		// Create a batch of objects
-		objects := make([]*TaskWithPriority, p.preWarmSize)
-		for i := 0; i < p.preWarmSize; i++ {
-			objects[i] = &TaskWithPriority{
-				priority: 0,
-				index:    -1,
-				task:     nil,
+		// Put objects directly into the pool to reduce memory overhead
+		// and avoid allocating a large slice
+		const batchSize = 200 // Process in smaller batches to reduce memory pressure
+		remaining := p.preWarmSize
+		
+		for remaining > 0 {
+			count := batchSize
+			if remaining < batchSize {
+				count = remaining
 			}
+			
+			for i := 0; i < count; i++ {
+				tp := &TaskWithPriority{
+					priority: 0,
+					index:    -1,
+					task:     nil,
+					sortKey:  0,
+				}
+				p.pool.Put(tp)
+			}
+			
+			remaining -= count
 		}
-
-		// Return them to the pool
-		for i := 0; i < p.preWarmSize; i++ {
-			p.pool.Put(objects[i])
-		}
-
-		// Clear the reference to the slice to allow GC
-		objects = nil
-		runtime.GC() // Force a GC to clean up temporary slice
 	})
 }
 
@@ -107,29 +112,28 @@ func (p *TaskWithPriorityPool) Get() *TaskWithPriority {
 	atomic.AddUint64(&p.stats.gets, 1)
 	inUse := atomic.AddUint64(&p.stats.inUse, 1)
 	
-	// Update max in use count if needed
-	for {
-		current := atomic.LoadUint64(&p.stats.maxInUse)
-		if inUse <= current {
-			break
-		}
-		if atomic.CompareAndSwapUint64(&p.stats.maxInUse, current, inUse) {
-			break
-		}
+	// Update max in use count if needed - use simplified approach
+	maxInUse := atomic.LoadUint64(&p.stats.maxInUse)
+	if inUse > maxInUse {
+		atomic.CompareAndSwapUint64(&p.stats.maxInUse, maxInUse, inUse)
 	}
 	
-	// Get from pool
+	// Get from pool - obj should never be nil for sync.Pool
 	obj := p.pool.Get()
-	if obj == nil {
+	tp, ok := obj.(*TaskWithPriority)
+	
+	// Fallback in case of unexpected behavior
+	if !ok || tp == nil {
 		atomic.AddUint64(&p.stats.misses, 1)
 		return &TaskWithPriority{
 			priority: 0,
 			index:    -1,
 			task:     nil,
+			sortKey:  0,
 		}
 	}
 	
-	return obj.(*TaskWithPriority)
+	return tp
 }
 
 // Put returns a TaskWithPriority object to the pool for future reuse.
@@ -147,16 +151,50 @@ func (p *TaskWithPriorityPool) Put(tp *TaskWithPriority) {
 	tp.task = nil
 	tp.priority = 0
 	tp.index = -1
+	tp.sortKey = 0
 	
 	p.pool.Put(tp)
 }
 
 // GetWithTask creates and initializes a TaskWithPriority from the pool with the given task and priority.
+// This is a more efficient way to get a pooled object with task and priority already set.
 func (p *TaskWithPriorityPool) GetWithTask(task ITask, priority int) *TaskWithPriority {
 	tp := p.Get()
 	tp.task = task
 	tp.priority = priority
+	// Generate a sort key (default index of 0 for now, will be updated on insertion)
+	tp.sortKey = ComputeSortKey(priority, 0)
 	return tp
+}
+
+// BatchGet retrieves multiple TaskWithPriority objects at once for bulk operations.
+// This can be more efficient than multiple individual Get calls.
+func (p *TaskWithPriorityPool) BatchGet(count int) []*TaskWithPriority {
+	if count <= 0 {
+		return nil
+	}
+	
+	result := make([]*TaskWithPriority, count)
+	for i := 0; i < count; i++ {
+		result[i] = p.Get()
+	}
+	return result
+}
+
+// BatchPut returns multiple TaskWithPriority objects to the pool at once.
+// This can be more efficient than multiple individual Put calls.
+func (p *TaskWithPriorityPool) BatchPut(items []*TaskWithPriority) {
+	if items == nil {
+		return
+	}
+	
+	for i := range items {
+		if items[i] != nil {
+			p.Put(items[i])
+			// Clear reference to help GC
+			items[i] = nil
+		}
+	}
 }
 
 // GetPoolStats returns a copy of the current pool statistics.

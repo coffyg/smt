@@ -34,7 +34,7 @@ type AdaptiveTimeoutManager struct {
 
 // NewAdaptiveTimeoutManager creates a new AdaptiveTimeoutManager
 func NewAdaptiveTimeoutManager(enabled bool) *AdaptiveTimeoutManager {
-	return &AdaptiveTimeoutManager{
+	manager := &AdaptiveTimeoutManager{
 		baseTimeouts:  make(map[string]map[string]time.Duration),
 		stats:         make(map[string]map[string]*AdaptiveTimeoutStats),
 		enabled:       enabled,
@@ -45,6 +45,11 @@ func NewAdaptiveTimeoutManager(enabled bool) *AdaptiveTimeoutManager {
 		minSampleSize: 5,     // Need at least 5 samples
 		decayInterval: 24 * time.Hour, // Decay stats once per day
 	}
+	
+	// Set global instance
+	globalAdaptiveTimeoutManager = manager
+	
+	return manager
 }
 
 // RegisterBaseTimeout registers a base timeout for a provider/callback pair
@@ -61,14 +66,44 @@ func (m *AdaptiveTimeoutManager) RegisterBaseTimeout(provider, callback string, 
 	m.baseTimeouts[provider][callback] = timeout
 }
 
+// Cache for adaptive timeouts to reduce lock contention
+type timeoutCacheEntry struct {
+	timeout    time.Duration
+	expiration time.Time
+}
+
+// Cached timeouts for frequently accessed provider+callback combinations
+var timeoutCache sync.Map // map[string]timeoutCacheEntry
+
+// Cache TTL for timeouts (1 second)
+const timeoutCacheTTL = 1 * time.Second
+
+// getCacheKey creates a cache key for the provider and callback
+func getCacheKey(provider, callback string) string {
+	return provider + ":" + callback
+}
+
 // GetTimeout returns the appropriate timeout for a task
 func (m *AdaptiveTimeoutManager) GetTimeout(callback, provider string) time.Duration {
+	// Fast path for disabled adaptive timeouts
 	if !m.enabled {
 		// Fallback to base timeout if adaptive timeouts are disabled
 		return m.getBaseTimeout(provider, callback)
 	}
 	
-	// Fast path with read lock first to avoid expensive RWLock.Lock when possible
+	// Check cache first to avoid lock contention
+	cacheKey := getCacheKey(provider, callback)
+	if entry, ok := timeoutCache.Load(cacheKey); ok {
+		cachedEntry := entry.(timeoutCacheEntry)
+		if time.Now().Before(cachedEntry.expiration) {
+			// Cache hit and still valid
+			return cachedEntry.timeout
+		}
+		// Cache expired, will recalculate
+	}
+	
+	// Cache miss or expired - calculate timeout
+	// Fast path with read lock first to avoid expensive RWLock.Lock
 	m.lock.RLock()
 	
 	// Get base timeout
@@ -81,26 +116,41 @@ func (m *AdaptiveTimeoutManager) GetTimeout(callback, provider string) time.Dura
 	if !exists || stats.count < m.minSampleSize {
 		// Not enough data to adjust, return base timeout
 		m.lock.RUnlock()
+		
+		// Cache the result
+		timeoutCache.Store(cacheKey, timeoutCacheEntry{
+			timeout:    baseTimeout,
+			expiration: time.Now().Add(timeoutCacheTTL),
+		})
+		
 		return baseTimeout
 	}
 	
-	// Calculate adjusted timeout based on average execution time (with read lock)
+	// Quickly grab the stats values we need under the lock
 	avgDurationMs := stats.avgDuration
-	if avgDurationMs <= 0 {
-		m.lock.RUnlock()
-		return baseTimeout
-	}
 	
-	// Convert to duration and add safety margin
-	avgDuration := time.Duration(avgDurationMs) * time.Millisecond
-	adjustedTimeout := time.Duration(float64(avgDuration) * m.safetyMargin)
-	
-	// Cache factors to avoid calculations with lock held
+	// Cache configuration parameters to avoid lock contention
 	minMultiplier := m.minMultiplier
 	maxMultiplier := m.maxMultiplier
+	safetyMargin := m.safetyMargin
 	
 	// We have all the data we need, release read lock
 	m.lock.RUnlock()
+	
+	// Fast path for invalid averages
+	if avgDurationMs <= 0 {
+		// Cache the result
+		timeoutCache.Store(cacheKey, timeoutCacheEntry{
+			timeout:    baseTimeout,
+			expiration: time.Now().Add(timeoutCacheTTL),
+		})
+		
+		return baseTimeout
+	}
+	
+	// Calculate actual timeout outside of lock
+	avgDuration := time.Duration(avgDurationMs) * time.Millisecond
+	adjustedTimeout := time.Duration(float64(avgDuration) * safetyMargin)
 	
 	// Apply min/max constraints based on base timeout (outside lock)
 	minTimeout := time.Duration(float64(baseTimeout) * minMultiplier)
@@ -112,7 +162,112 @@ func (m *AdaptiveTimeoutManager) GetTimeout(callback, provider string) time.Dura
 		adjustedTimeout = maxTimeout
 	}
 	
+	// Cache the result
+	timeoutCache.Store(cacheKey, timeoutCacheEntry{
+		timeout:    adjustedTimeout,
+		expiration: time.Now().Add(timeoutCacheTTL),
+	})
+	
 	return adjustedTimeout
+}
+
+// execRecord represents a pending execution record
+type execRecord struct {
+	provider   string
+	callback   string
+	durationMs int64
+	timeout    time.Duration
+	timestamp  time.Time
+}
+
+// execRecordChan is a buffered channel for background processing of execution records
+var execRecordChan = make(chan execRecord, 1000)
+
+// global adaptive timeout manager instance
+var globalAdaptiveTimeoutManager *AdaptiveTimeoutManager
+
+// init starts the background execution record processor
+func init() {
+	go processExecRecords()
+}
+
+// processExecRecords processes execution records in the background
+func processExecRecords() {
+	recordBatch := make([]execRecord, 0, 100)
+	
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case record := <-execRecordChan:
+			recordBatch = append(recordBatch, record)
+			
+			// Process in batches for efficiency
+			if len(recordBatch) >= 100 && globalAdaptiveTimeoutManager != nil {
+				processRecordBatch(globalAdaptiveTimeoutManager, recordBatch)
+				recordBatch = recordBatch[:0] // Clear batch
+			}
+			
+		case <-ticker.C:
+			// Process any remaining records periodically
+			if len(recordBatch) > 0 && globalAdaptiveTimeoutManager != nil {
+				processRecordBatch(globalAdaptiveTimeoutManager, recordBatch)
+				recordBatch = recordBatch[:0] // Clear batch
+			}
+		}
+	}
+}
+
+// processRecordBatch processes a batch of execution records
+func processRecordBatch(m *AdaptiveTimeoutManager, records []execRecord) {
+	// Skip if adaptive timeouts are disabled
+	if !m.enabled {
+		return
+	}
+	
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	
+	for _, record := range records {
+		if record.durationMs <= 0 {
+			continue
+		}
+		
+		// Initialize maps if they don't exist
+		if _, exists := m.stats[record.provider]; !exists {
+			m.stats[record.provider] = make(map[string]*AdaptiveTimeoutStats)
+		}
+		
+		// Get or create stats
+		stats, exists := m.stats[record.provider][record.callback]
+		if !exists {
+			stats = &AdaptiveTimeoutStats{
+				minDuration:       record.durationMs,
+				maxDuration:       record.durationMs,
+				lastActualTimeout: record.timeout,
+			}
+			m.stats[record.provider][record.callback] = stats
+		}
+		
+		// Update stats
+		stats.count++
+		stats.sumDuration += record.durationMs
+		stats.avgDuration = stats.sumDuration / stats.count
+		
+		if record.durationMs < stats.minDuration {
+			stats.minDuration = record.durationMs
+		}
+		if record.durationMs > stats.maxDuration {
+			stats.maxDuration = record.durationMs
+		}
+		
+		stats.lastUpdated = record.timestamp
+		stats.lastActualTimeout = record.timeout
+		
+		// Invalidate cache for this entry
+		timeoutCache.Delete(getCacheKey(record.provider, record.callback))
+	}
 }
 
 // RecordExecution records the execution time of a task
@@ -121,44 +276,19 @@ func (m *AdaptiveTimeoutManager) RecordExecution(provider, callback string, dura
 		return
 	}
 	
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	
-	// Initialize maps if they don't exist
-	if _, exists := m.stats[provider]; !exists {
-		m.stats[provider] = make(map[string]*AdaptiveTimeoutStats)
-	}
-	
-	// Get or create stats
-	stats, exists := m.stats[provider][callback]
-	if !exists {
-		stats = &AdaptiveTimeoutStats{
-			minDuration: durationMs,
-			maxDuration: durationMs,
-			lastActualTimeout: timeout,
-		}
-		m.stats[provider][callback] = stats
-	}
-	
-	// Update stats
-	stats.count++
-	stats.sumDuration += durationMs
-	stats.avgDuration = stats.sumDuration / stats.count
-	
-	if durationMs < stats.minDuration {
-		stats.minDuration = durationMs
-	}
-	if durationMs > stats.maxDuration {
-		stats.maxDuration = durationMs
-	}
-	
-	stats.lastUpdated = time.Now()
-	stats.lastActualTimeout = timeout
-	
-	// Apply adaptive adjustment if we have enough samples
-	if stats.count >= m.minSampleSize {
-		// We've already applied the changes in GetTimeout
-		// This just updates our tracking stats
+	// Send execution record to background worker via non-blocking channel
+	select {
+	case execRecordChan <- execRecord{
+		provider:   provider,
+		callback:   callback,
+		durationMs: durationMs,
+		timeout:    timeout,
+		timestamp:  time.Now(),
+	}:
+		// Record sent successfully
+	default:
+		// Channel full, drop record
+		// This is acceptable as we prioritize performance over recording every execution
 	}
 }
 
