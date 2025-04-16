@@ -108,3 +108,81 @@ func TestTaskWithPriorityPoolConcurrent(t *testing.T) {
 	
 	wg.Wait()
 }
+
+// Test pool with custom configuration
+func TestTaskWithPriorityPoolConfig(t *testing.T) {
+	// Test with custom configuration
+	pool := NewTaskWithPriorityPoolConfig(&PoolConfig{
+		PreWarmSize:  2000,
+		TrackStats:   true,
+		PreWarmAsync: false,
+	})
+	
+	// Verify pool is initialized correctly
+	if pool == nil {
+		t.Fatal("Pool should not be nil")
+	}
+	
+	// Test basic usage
+	task := &MockTask{id: "config-test-task"}
+	
+	// Get objects and verify they work properly
+	tp1 := pool.GetWithTask(task, 5)
+	if tp1.task != task {
+		t.Error("Pool should set the task")
+	}
+	if tp1.priority != 5 {
+		t.Error("Pool should set the priority")
+	}
+	
+	// Return to pool
+	pool.Put(tp1)
+	
+	// Verify stats are being tracked
+	gets, puts, _, _, _ := pool.GetPoolStats()
+	if gets < 1 {
+		t.Error("Pool should track gets")
+	}
+	if puts < 1 {
+		t.Error("Pool should track puts")
+	}
+	
+	// Verify it works after getting another object
+	tp2 := pool.Get()
+	if tp2.task != nil {
+		t.Error("Pool should reset task to nil")
+	}
+	if tp2.priority != 0 {
+		t.Error("Pool should reset priority to 0")
+	}
+	
+	// Verify stats again
+	getsAfter, _, _, inUseAfter, _ := pool.GetPoolStats()
+	if getsAfter <= gets {
+		t.Error("Pool should increment gets count")
+	}
+	if inUseAfter < 1 {
+		t.Error("Pool should track objects in use")
+	}
+	
+	// Clean up
+	pool.Put(tp2)
+}
+
+// Test handling of nil objects
+func TestTaskWithPriorityPoolNilHandling(t *testing.T) {
+	pool := NewTaskWithPriorityPool()
+	
+	// Test putting nil (should not panic)
+	pool.Put(nil)
+	
+	// Test putting after setting task to nil
+	tp := pool.Get()
+	tp.task = nil
+	pool.Put(tp) // Should not cause issues
+	
+	// Test double put (should not cause issues, but could be wasteful)
+	tp2 := pool.Get()
+	pool.Put(tp2)
+	pool.Put(tp2) // Duplicate put
+}

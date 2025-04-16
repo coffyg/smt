@@ -68,22 +68,26 @@ func (m *AdaptiveTimeoutManager) GetTimeout(callback, provider string) time.Dura
 		return m.getBaseTimeout(provider, callback)
 	}
 	
+	// Fast path with read lock first to avoid expensive RWLock.Lock when possible
 	m.lock.RLock()
-	defer m.lock.RUnlock()
 	
 	// Get base timeout
 	baseTimeout := m.getBaseTimeoutLocked(provider, callback)
 	
 	// Get stats if available
 	stats, exists := m.getStatsLocked(provider, callback)
+	
+	// If we have insufficient data, return early with base timeout
 	if !exists || stats.count < m.minSampleSize {
 		// Not enough data to adjust, return base timeout
+		m.lock.RUnlock()
 		return baseTimeout
 	}
 	
-	// Calculate adjusted timeout based on average execution time
+	// Calculate adjusted timeout based on average execution time (with read lock)
 	avgDurationMs := stats.avgDuration
 	if avgDurationMs <= 0 {
+		m.lock.RUnlock()
 		return baseTimeout
 	}
 	
@@ -91,9 +95,16 @@ func (m *AdaptiveTimeoutManager) GetTimeout(callback, provider string) time.Dura
 	avgDuration := time.Duration(avgDurationMs) * time.Millisecond
 	adjustedTimeout := time.Duration(float64(avgDuration) * m.safetyMargin)
 	
-	// Apply min/max constraints based on base timeout
-	minTimeout := time.Duration(float64(baseTimeout) * m.minMultiplier)
-	maxTimeout := time.Duration(float64(baseTimeout) * m.maxMultiplier)
+	// Cache factors to avoid calculations with lock held
+	minMultiplier := m.minMultiplier
+	maxMultiplier := m.maxMultiplier
+	
+	// We have all the data we need, release read lock
+	m.lock.RUnlock()
+	
+	// Apply min/max constraints based on base timeout (outside lock)
+	minTimeout := time.Duration(float64(baseTimeout) * minMultiplier)
+	maxTimeout := time.Duration(float64(baseTimeout) * maxMultiplier)
 	
 	if adjustedTimeout < minTimeout {
 		adjustedTimeout = minTimeout

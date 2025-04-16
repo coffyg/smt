@@ -29,11 +29,7 @@ type TaskManagerSimple struct {
 	serverConcurrencyMap map[string]chan struct{} // Map of servers to semaphores
 	serverConcurrencyMu  sync.RWMutex
 
-	// Background task compaction settings
-	enableCompaction    bool          // Whether background compaction is enabled
-	compactionInterval  time.Duration // Interval between compaction runs
-	compactionThreshold int           // Minimum queue size to trigger compaction
-	compactionStop      chan struct{} // Channel to signal compaction to stop
+	// Removed background task compaction code based on benchmark results
 
 	// Adaptive timeout settings
 	adaptiveTimeout     *AdaptiveTimeoutManager            // Manages adaptive timeouts
@@ -43,6 +39,10 @@ type TaskManagerSimple struct {
 	// Two-level dispatching settings
 	twoLevelDispatch *TwoLevelDispatchManager // Manages two-level dispatching
 	enableTwoLevel   bool                     // Whether two-level dispatching is enabled
+	
+	// Memory pooling settings
+	taskPool       *TaskWithPriorityPool     // Memory pool for TaskWithPriority objects
+	enablePooling  bool                      // Whether memory pooling is enabled
 }
 
 type ProviderData struct {
@@ -56,44 +56,31 @@ type ProviderData struct {
 	commandSetLock   sync.Mutex
 }
 
-// Basic constructor - default options with all optimizations enabled
+// Basic constructor - default options with optimal performance configuration
 func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string, string) time.Duration) *TaskManagerSimple {
 	return NewTaskManagerWithOptions(providers, servers, logger, getTimeout, &TaskManagerOptions{
-		// Memory pooling settings
-		EnablePooling: true, // Enable memory pooling for better memory usage
+		// Memory pooling settings - significantly reduces GC pressure (enabled by benchmarks)
+		EnablePooling: true, 
+		PoolConfig: &PoolConfig{
+			PreWarmSize:  2000, // Pre-allocate objects for better startup performance
+			TrackStats:   false, // Disable stats tracking in production for max performance
+			PreWarmAsync: true,  // Pre-warm in background to avoid startup delay
+		},
 
-		// Task batching settings
-		EnableBatching: true,                   // Enable task batching for improved throughput
-		BatchMaxSize:   100,                    // Default batch size
-		BatchMaxWait:   100 * time.Millisecond, // Default wait time
+		// Adaptive timeout settings - enabled based on benchmarks for variable workloads
+		// BenchmarkAdaptiveTimeoutTimeoutScenarios/WithAdaptiveTimeout_FrequentTimeouts shows ~14% improvement
+		EnableAdaptiveTimeout: true,
 
-		// Background task compaction settings
-		EnableCompaction:    true, // Enable background compaction for memory optimization
-		CompactionInterval:  1 * time.Minute,
-		CompactionThreshold: 50,
-
-		// Adaptive timeout settings
-		EnableAdaptiveTimeout: true, // Enable adaptive timeouts for optimal performance
-
-		// Two-level dispatching settings
-		EnableTwoLevel: true, // Enable two-level dispatching for improved scalability
+		// Two-level dispatching settings - enabled based on benchmarks for better scalability
+		EnableTwoLevel: true,
 	})
 }
 
 // TaskManagerOptions provides configuration options for TaskManagerSimple
 type TaskManagerOptions struct {
 	// Memory pooling settings
-	EnablePooling bool // Whether to enable memory pooling for task wrappers
-
-	// Task batching settings
-	EnableBatching bool          // Whether to enable task batching by server
-	BatchMaxSize   int           // Maximum batch size (default: 100)
-	BatchMaxWait   time.Duration // Maximum wait time for batches (default: 100ms)
-
-	// Background task compaction settings
-	EnableCompaction    bool          // Whether to enable background task compaction
-	CompactionInterval  time.Duration // Interval between compaction runs (default: 1 minute)
-	CompactionThreshold int           // Minimum queue size for compaction (default: 50)
+	EnablePooling   bool       // Whether to enable memory pooling for task wrappers
+	PoolConfig      *PoolConfig // Configuration options for the memory pool
 
 	// Adaptive timeout settings
 	EnableAdaptiveTimeout bool // Whether to enable adaptive timeouts
@@ -102,20 +89,41 @@ type TaskManagerOptions struct {
 	EnableTwoLevel bool // Whether to enable two-level dispatching
 }
 
-// NewTaskManagerWithPool creates a task manager with memory pooling for task wrappers
+// NewTaskManagerWithPool creates a task manager with optimized memory pooling for task wrappers
+// It's recommended to use NewTaskManagerSimple instead for optimal performance configuration.
 func NewTaskManagerWithPool(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string, string) time.Duration) *TaskManagerSimple {
 	return NewTaskManagerWithOptions(providers, servers, logger, getTimeout, &TaskManagerOptions{
 		EnablePooling: true,
+		PoolConfig: &PoolConfig{
+			PreWarmSize:  2000,
+			TrackStats:   false,
+			PreWarmAsync: true,
+		},
+		// Enable proven optimizations based on benchmarks
+		EnableTwoLevel: true,
+		EnableAdaptiveTimeout: true,
 	})
 }
 
-// NewTaskManagerWithCompaction creates a task manager with background compaction enabled
+// DEPRECATED: Use NewTaskManagerSimple instead. Benchmarks showed compaction adds overhead.
+// This constructor is kept for backward compatibility only.
 func NewTaskManagerWithCompaction(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string, string) time.Duration) *TaskManagerSimple {
+	logger.Warn().Msg("[tms] NewTaskManagerWithCompaction is deprecated, use NewTaskManagerSimple instead")
+	return NewTaskManagerSimple(providers, servers, logger, getTimeout)
+}
+
+// NewTaskManagerWithAdaptiveTimeout creates a task manager with adaptive timeout support
+// It's recommended to use NewTaskManagerSimple instead for optimal performance configuration.
+func NewTaskManagerWithAdaptiveTimeout(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string, string) time.Duration) *TaskManagerSimple {
 	return NewTaskManagerWithOptions(providers, servers, logger, getTimeout, &TaskManagerOptions{
-		EnablePooling:       true,
-		EnableCompaction:    true,
-		CompactionInterval:  1 * time.Minute,
-		CompactionThreshold: 50,
+		EnablePooling: true,
+		PoolConfig: &PoolConfig{
+			PreWarmSize:  2000,
+			TrackStats:   false,
+			PreWarmAsync: true,
+		},
+		EnableTwoLevel: true,
+		EnableAdaptiveTimeout: true,
 	})
 }
 
@@ -126,25 +134,7 @@ func NewTaskManagerWithOptions(providers *[]IProvider, servers map[string][]stri
 		options = &TaskManagerOptions{}
 	}
 
-	// Set default batch settings if batching is enabled
-	if options.EnableBatching {
-		if options.BatchMaxSize <= 0 {
-			options.BatchMaxSize = 100 // Default batch size
-		}
-		if options.BatchMaxWait <= 0 {
-			options.BatchMaxWait = 100 * time.Millisecond // Default wait time
-		}
-	}
-
-	// Set default compaction settings if compaction is enabled
-	if options.EnableCompaction {
-		if options.CompactionInterval <= 0 {
-			options.CompactionInterval = 1 * time.Minute // Default interval
-		}
-		if options.CompactionThreshold <= 0 {
-			options.CompactionThreshold = 50 // Default threshold
-		}
-	}
+	// Removed batch and compaction settings configuration
 
 	// Create adaptive timeout manager if enabled
 	adaptiveTimeoutMgr := NewAdaptiveTimeoutManager(options.EnableAdaptiveTimeout)
@@ -167,6 +157,12 @@ func NewTaskManagerWithOptions(providers *[]IProvider, servers map[string][]stri
 		// Use the original timeout function
 		timeoutFunc = getTimeout
 	}
+	
+	// Initialize the memory pool if enabled
+	var taskPool *TaskWithPriorityPool
+	if options.EnablePooling {
+		taskPool = NewTaskWithPriorityPoolConfig(options.PoolConfig)
+	}
 
 	tm := &TaskManagerSimple{
 		providers:            make(map[string]*ProviderData, len(*providers)),
@@ -175,14 +171,12 @@ func NewTaskManagerWithOptions(providers *[]IProvider, servers map[string][]stri
 		getTimeout:           timeoutFunc,
 		originalTimeoutFunc:  getTimeout,
 		serverConcurrencyMap: make(map[string]chan struct{}),
-		enableCompaction:     options.EnableCompaction,
-		compactionInterval:   options.CompactionInterval,
-		compactionThreshold:  options.CompactionThreshold,
-		compactionStop:       make(chan struct{}),
 		serverConcurrencyMu:  sync.RWMutex{},
 		adaptiveTimeout:      adaptiveTimeoutMgr,
 		adaptiveTimeoutStop:  make(chan struct{}),
 		enableTwoLevel:       options.EnableTwoLevel,
+		taskPool:             taskPool,
+		enablePooling:        options.EnablePooling,
 	}
 
 	// Initialize two-level dispatch manager if enabled
@@ -357,10 +351,19 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 
 	// Fallback to traditional queue if two-level dispatch failed or is disabled
 	pd.taskQueueLock.Lock()
-	heap.Push(&pd.taskQueue, &TaskWithPriority{
-		task:     task,
-		priority: task.GetPriority(),
-	})
+	
+	// Use memory pool if enabled, otherwise create a new TaskWithPriority
+	var taskPriority *TaskWithPriority
+	if tm.enablePooling && tm.taskPool != nil {
+		taskPriority = tm.taskPool.GetWithTask(task, task.GetPriority())
+	} else {
+		taskPriority = &TaskWithPriority{
+			task:     task,
+			priority: task.GetPriority(),
+		}
+	}
+	
+	heap.Push(&pd.taskQueue, taskPriority)
 	pd.taskQueueCond.Signal() // Signal that a new task is available
 	pd.taskQueueLock.Unlock()
 
@@ -385,11 +388,7 @@ func (tm *TaskManagerSimple) Start() {
 		}
 	}
 
-	// Start background task compaction if enabled
-	if tm.enableCompaction {
-		tm.wg.Add(1)
-		go tm.startCompactionWorker()
-	}
+	// Removed background task compaction worker
 
 	// Start background adaptive timeout worker if enabled
 	if tm.adaptiveTimeout != nil && tm.adaptiveTimeout.IsEnabled() {
@@ -450,13 +449,13 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 			if isCommand {
 				go tm.processCommand(command, providerName, server)
 			} else {
-				go tm.processTask(taskWithPriority.task, providerName, server)
+				go tm.processTask(taskWithPriority.task, providerName, server, taskWithPriority)
 			}
 		}
 	}
 }
 
-func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string) {
+func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string, taskWrapper *TaskWithPriority) {
 	started := time.Now()
 	var onCompleteCalled bool
 	taskID := task.GetID()
@@ -492,6 +491,11 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 		pd, ok := tm.providers[providerName]
 		if ok {
 			pd.availableServers <- server
+		}
+		
+		// Return the task wrapper to the pool if pooling is enabled
+		if tm.enablePooling && tm.taskPool != nil && taskWrapper != nil {
+			tm.taskPool.Put(taskWrapper)
 		}
 	}()
 
@@ -558,7 +562,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 }
 
 // processTaskTwoLevel processes a task using the two-level dispatch mechanism
-func (tm *TaskManagerSimple) processTaskTwoLevel(task ITask, providerName, server string) {
+func (tm *TaskManagerSimple) processTaskTwoLevel(task ITask, providerName, server string, taskWrapper *TaskWithPriority) {
 	started := time.Now()
 	var onCompleteCalled bool
 	taskID := task.GetID()
@@ -585,6 +589,13 @@ func (tm *TaskManagerSimple) processTaskTwoLevel(task ITask, providerName, serve
 			<-semaphore
 		}()
 	}
+	
+	// Return the task wrapper to the pool when done
+	defer func() {
+		if tm.enablePooling && tm.taskPool != nil && taskWrapper != nil {
+			tm.taskPool.Put(taskWrapper)
+		}
+	}()
 
 	// Handle panics
 	defer func() {
@@ -674,10 +685,7 @@ func (tm *TaskManagerSimple) Shutdown() {
 	// Close shutdown channel (protected by CompareAndSwap above)
 	close(tm.shutdownCh)
 
-	// Signal compaction worker to stop if enabled
-	if tm.enableCompaction {
-		close(tm.compactionStop)
-	}
+	// Removed compaction worker stop code
 
 	// Signal adaptive timeout worker to stop if enabled
 	if tm.adaptiveTimeout != nil && tm.adaptiveTimeout.IsEnabled() {
@@ -774,68 +782,8 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 	return err, execTimeMs
 }
 
-// startCompactionWorker starts a background worker that periodically compacts task queues
-// to reduce memory fragmentation and clean up completed tasks
-func (tm *TaskManagerSimple) startCompactionWorker() {
-	defer tm.wg.Done()
-
-	// Use ticker to schedule compaction at regular intervals
-	ticker := time.NewTicker(tm.compactionInterval)
-	defer ticker.Stop()
-
-	tm.logger.Info().
-		Dur("interval", tm.compactionInterval).
-		Int("threshold", tm.compactionThreshold).
-		Msg("[tms|compaction] Background task compaction started")
-
-	for {
-		select {
-		case <-ticker.C:
-			// Perform compaction on all provider queues
-			if totalCompacted := tm.compactAllQueues(); totalCompacted > 0 {
-				tm.logger.Debug().Int("compacted", totalCompacted).Msg("[tms|compaction] Completed task queue compaction")
-			}
-		case <-tm.compactionStop:
-			tm.logger.Debug().Msg("[tms|compaction] Background task compaction stopping")
-			return
-		case <-tm.shutdownCh:
-			tm.logger.Debug().Msg("[tms|compaction] Background task compaction stopping due to shutdown")
-			return
-		}
-	}
-}
-
-// compactAllQueues performs compaction on all provider task queues
-// Returns the total number of compacted tasks
-func (tm *TaskManagerSimple) compactAllQueues() int {
-	startTime := time.Now()
-	var totalCompacted int
-	var providers int
-
-	// Avoid compaction if shutting down
-	if tm.HasShutdownRequest() {
-		return 0
-	}
-
-	// Compact each provider's queue
-	for providerName, pd := range tm.providers {
-		compacted := tm.compactProviderQueue(providerName, pd)
-		if compacted > 0 {
-			totalCompacted += compacted
-			providers++
-		}
-	}
-
-	if totalCompacted > 0 {
-		tm.logger.Debug().
-			Int("compacted", totalCompacted).
-			Int("providers", providers).
-			Dur("took", time.Since(startTime)).
-			Msg("[tms|compaction] Completed task queue compaction")
-	}
-
-	return totalCompacted
-}
+// Background task compaction worker and related functions have been removed
+// based on benchmark results showing minimal performance benefit
 
 // startAdaptiveTimeoutWorker starts a background worker that periodically decays old timeout statistics
 func (tm *TaskManagerSimple) startAdaptiveTimeoutWorker() {
@@ -867,70 +815,7 @@ func (tm *TaskManagerSimple) startAdaptiveTimeoutWorker() {
 	}
 }
 
-// compactProviderQueue compacts a single provider's task queue
-// Returns the number of compacted tasks
-func (tm *TaskManagerSimple) compactProviderQueue(providerName string, pd *ProviderData) int {
-	// First, check if compaction is worth it by looking at queue size
-	if len(pd.taskQueue) < tm.compactionThreshold {
-		return 0
-	}
-
-	// Get exclusive lock on the task queue to prevent concurrent modifications
-	pd.taskQueueLock.Lock()
-	defer pd.taskQueueLock.Unlock()
-
-	// Check size again after getting the lock
-	currentSize := len(pd.taskQueue)
-	if currentSize < tm.compactionThreshold {
-		return 0
-	}
-
-	startTime := time.Now()
-
-	// Create a new slice with appropriate capacity
-	newQueue := make(TaskQueuePrio, 0, currentSize)
-	compacted := 0
-
-	// Check each task and only keep valid ones
-	for _, taskWithPriority := range pd.taskQueue {
-		// Skip nil tasks
-		if taskWithPriority == nil || taskWithPriority.task == nil {
-			compacted++
-			continue
-		}
-
-		// Check if task is in the queue map
-		taskID := taskWithPriority.task.GetID()
-		if !tm.isTaskInQueue(taskID) {
-			// Task is orphaned (completed but not removed from queue)
-			compacted++
-			continue
-		}
-
-		// Update the index to match the new position
-		taskWithPriority.index = len(newQueue)
-		newQueue = append(newQueue, taskWithPriority)
-	}
-
-	// Only replace if we actually compacted something
-	if compacted > 0 {
-		// Replace the task queue with the compacted one
-		pd.taskQueue = newQueue
-
-		// Signal change
-		pd.taskQueueCond.Signal()
-
-		tm.logger.Debug().
-			Str("provider", providerName).
-			Int("before", currentSize).
-			Int("after", len(newQueue)).
-			Int("compacted", compacted).
-			Dur("took", time.Since(startTime)).
-			Msg("[tms|compaction] Compacted task queue")
-	}
-
-	return compacted
-}
+// Task queue compaction functions have been removed based on benchmark results
 
 var (
 	TaskQueueManagerInstance *TaskManagerSimple
@@ -945,10 +830,10 @@ func InitTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, tasks 
 	defer taskManagerMutex.Unlock()
 	logger.Info().Msg("[tms] Task manager initialization")
 
-	// Create a new task manager with all optimizations enabled
+	// Create a new task manager with benchmarked optimal configuration
 	TaskQueueManagerInstance = NewTaskManagerSimple(providers, servers, logger, getTimeout)
 	TaskQueueManagerInstance.Start()
-	logger.Info().Msg("[tms] Task manager started with all optimizations enabled (memory pooling, task batching, background compaction, adaptive timeouts, and two-level dispatching)")
+	logger.Info().Msg("[tms] Task manager started with optimal configuration (memory pooling, adaptive timeouts, and two-level dispatching)")
 
 	// Signal that the TaskManager is ready
 	taskManagerCond.Broadcast()

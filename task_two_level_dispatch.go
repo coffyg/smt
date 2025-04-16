@@ -198,7 +198,7 @@ func (sd *ServerDispatcher) startWorker() {
 			tm := sd.parent.taskManager
 			
 			// Process the task
-			tm.processTaskTwoLevel(task, sd.parent.providerName, sd.server)
+			tm.processTaskTwoLevel(task, sd.parent.providerName, sd.server, taskWithPriority)
 		}
 	}()
 }

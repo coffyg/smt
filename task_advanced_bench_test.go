@@ -9,75 +9,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// BatchableMockTask implements BatchableTask for benchmarking
-type BatchableMockTask struct {
-	*MockTask
-	batchKey string
-}
-
-func (t *BatchableMockTask) BatchKey() string {
-	return t.batchKey
-}
-
-func (t *BatchableMockTask) CanBatchWith(other BatchableTask) bool {
-	return t.batchKey == other.BatchKey()
-}
-
-func (t *BatchableMockTask) MergeWith(other BatchableTask) BatchableTask {
-	// For testing, we just return the first task
-	return t
-}
-
-// BenchmarkTaskBatcher benchmarks the task batcher
-func BenchmarkTaskBatcher(b *testing.B) {
-	// Set up a simple processor function
-	var processed int
-	var processedLock sync.Mutex
-	
-	processFn := func(batch *TaskBatch) {
-		processedLock.Lock()
-		processed += batch.Size()
-		processedLock.Unlock()
-	}
-	
-	// Create a task batcher
-	batcher := NewTaskBatcher(10, 50*time.Millisecond, processFn)
-	
-	// Create a test provider
-	provider := &MockProvider{name: "batchProvider"}
-	
-	b.ResetTimer()
-	
-	// Add tasks to the batcher
-	for i := 0; i < b.N; i++ {
-		// Create 10 different batch keys
-		batchKey := fmt.Sprintf("batch%d", i%10)
-		
-		task := &BatchableMockTask{
-			MockTask: &MockTask{
-				id:         fmt.Sprintf("task%d", i),
-				priority:   i % 5,
-				maxRetries: 3,
-				createdAt:  time.Now(),
-				provider:   provider,
-				timeout:    time.Second * 5,
-			},
-			batchKey: batchKey,
-		}
-		
-		batcher.Add(task)
-	}
-	
-	// Wait for all batches to be processed
-	time.Sleep(100 * time.Millisecond)
-	
-	// Verify all tasks were processed
-	processedLock.Lock()
-	if processed < b.N {
-		b.Logf("Only processed %d of %d tasks", processed, b.N)
-	}
-	processedLock.Unlock()
-}
+// Removed batching benchmarks and related code
 
 // BenchmarkWorkerPool benchmarks the worker pool
 func BenchmarkWorkerPool(b *testing.B) {
