@@ -183,6 +183,15 @@ func NewTaskManagerWithOptions(providers *[]IProvider, servers map[string][]stri
 	if options.EnableTwoLevel {
 		tm.twoLevelDispatch = NewTwoLevelDispatchManager(tm, true)
 	}
+	
+	// Ensure memory pool is initialized if pooling is enabled
+	if options.EnablePooling && tm.taskPool == nil {
+		tm.taskPool = NewTaskWithPriorityPoolConfig(&PoolConfig{
+			PreWarmSize:  1000,
+			TrackStats:   false,
+			PreWarmAsync: true,
+		})
+	}
 
 	// Initialize providers - this is done only once, so optimize for clarity
 	for _, provider := range *providers {

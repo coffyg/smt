@@ -124,10 +124,17 @@ func (sd *ServerDispatcher) EnqueueTask(task ITask) {
 		return
 	}
 	
-	heap.Push(&sd.taskQueue, &TaskWithPriority{
-		task:     task,
-		priority: task.GetPriority(),
-	})
+	// Use the parent's task pool if available to avoid memory allocation
+	var taskWithPriority *TaskWithPriority
+	if tm := sd.parent.taskManager; tm != nil && tm.enablePooling && tm.taskPool != nil {
+		taskWithPriority = tm.taskPool.GetWithTask(task, task.GetPriority())
+	} else {
+		taskWithPriority = &TaskWithPriority{
+			task:     task,
+			priority: task.GetPriority(),
+		}
+	}
+	heap.Push(&sd.taskQueue, taskWithPriority)
 	sd.taskQueueCond.Signal()
 }
 
