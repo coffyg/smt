@@ -46,8 +46,10 @@ func NewAdaptiveTimeoutManager(enabled bool) *AdaptiveTimeoutManager {
 		decayInterval: 24 * time.Hour, // Decay stats once per day
 	}
 	
-	// Set global instance
+	// Set global instance with proper lock
+	globalManagerMutex.Lock()
 	globalAdaptiveTimeoutManager = manager
+	globalManagerMutex.Unlock()
 	
 	return manager
 }
@@ -184,7 +186,11 @@ type execRecord struct {
 var execRecordChan = make(chan execRecord, 1000)
 
 // global adaptive timeout manager instance
-var globalAdaptiveTimeoutManager *AdaptiveTimeoutManager
+var (
+	globalAdaptiveTimeoutManager *AdaptiveTimeoutManager
+	globalManagerMutex           sync.RWMutex
+	processingStarted            bool
+)
 
 // init starts the background execution record processor
 func init() {
@@ -203,17 +209,29 @@ func processExecRecords() {
 		case record := <-execRecordChan:
 			recordBatch = append(recordBatch, record)
 			
-			// Process in batches for efficiency
-			if len(recordBatch) >= 100 && globalAdaptiveTimeoutManager != nil {
-				processRecordBatch(globalAdaptiveTimeoutManager, recordBatch)
-				recordBatch = recordBatch[:0] // Clear batch
+			// Process in batches for efficiency - use mutex to safely access global manager
+			if len(recordBatch) >= 100 {
+				globalManagerMutex.RLock()
+				mgr := globalAdaptiveTimeoutManager
+				globalManagerMutex.RUnlock()
+				
+				if mgr != nil {
+					processRecordBatch(mgr, recordBatch)
+					recordBatch = recordBatch[:0] // Clear batch
+				}
 			}
 			
 		case <-ticker.C:
-			// Process any remaining records periodically
-			if len(recordBatch) > 0 && globalAdaptiveTimeoutManager != nil {
-				processRecordBatch(globalAdaptiveTimeoutManager, recordBatch)
-				recordBatch = recordBatch[:0] // Clear batch
+			// Process any remaining records periodically - use mutex to safely access global manager
+			if len(recordBatch) > 0 {
+				globalManagerMutex.RLock()
+				mgr := globalAdaptiveTimeoutManager
+				globalManagerMutex.RUnlock()
+				
+				if mgr != nil {
+					processRecordBatch(mgr, recordBatch)
+					recordBatch = recordBatch[:0] // Clear batch
+				}
 			}
 		}
 	}
