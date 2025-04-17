@@ -14,7 +14,7 @@ import (
 func BenchmarkComprehensiveConfig(b *testing.B) {
 	logger := zerolog.Nop()
 	
-	// Define configurations to test
+	// Define configurations to test - testing all possible combinations
 	configs := []struct {
 		name                string
 		enablePooling       bool
@@ -22,86 +22,106 @@ func BenchmarkComprehensiveConfig(b *testing.B) {
 		enableTwoLevel      bool
 	}{
 		{
-			name:                "MinimalOptimal", // Current optimal configuration
+			name:                "Baseline",
+			enablePooling:       false,
+			enableAdaptiveTimeout: false,
+			enableTwoLevel:      false,
+		},
+		{
+			name:                "MemPoolOnly",
+			enablePooling:       true,
+			enableAdaptiveTimeout: false,
+			enableTwoLevel:      false,
+		},
+		{
+			name:                "TwoLevelOnly",
+			enablePooling:       false,
+			enableAdaptiveTimeout: false,
+			enableTwoLevel:      true,
+		},
+		{
+			name:                "AdaptiveOnly",
+			enablePooling:       false,
+			enableAdaptiveTimeout: true,
+			enableTwoLevel:      false,
+		},
+		{
+			name:                "MemPool_TwoLevel",
 			enablePooling:       true,
 			enableAdaptiveTimeout: false,
 			enableTwoLevel:      true,
 		},
 		{
-			name:                "AllFeaturesEnabled", // All features
+			name:                "MemPool_Adaptive",
+			enablePooling:       true,
+			enableAdaptiveTimeout: true,
+			enableTwoLevel:      false,
+		},
+		{
+			name:                "TwoLevel_Adaptive",
+			enablePooling:       false,
+			enableAdaptiveTimeout: true,
+			enableTwoLevel:      true,
+		},
+		{
+			name:                "AllFeatures", // Default NewTaskManagerSimple behavior
 			enablePooling:       true,
 			enableAdaptiveTimeout: true,
 			enableTwoLevel:      true,
 		},
 	}
 	
-	// Define workload scenarios
+	// Define workload scenarios with focus on 6 server configuration as requested
 	scenarios := []struct {
-		name           string
-		providerCount  int
+		name             string
+		providerCount    int
 		serversPerProvider int
 		tasksPerProvider int
-		taskDuration   time.Duration
-		variableExec   bool  // Whether execution time is variable
-		highParallelism bool // Whether to use high concurrency
+		taskDuration     time.Duration
+		variableExec     bool
+		highParallelism  bool
 	}{
-		// Small load scenarios
+		// Six server focused scenario with consistent timing (requested scenario)
 		{
-			name:             "SmallLoad_LowParallelism",
-			providerCount:    3,
-			serversPerProvider: 2,
-			tasksPerProvider: 100,
-			taskDuration:     5 * time.Millisecond,
-			variableExec:     false,
-			highParallelism:  false,
-		},
-		{
-			name:             "SmallLoad_HighParallelism",
-			providerCount:    3,
-			serversPerProvider: 2,
-			tasksPerProvider: 100,
-			taskDuration:     5 * time.Millisecond,
+			name:             "SixServers_ConsistentTiming",
+			providerCount:    1,
+			serversPerProvider: 6,
+			tasksPerProvider: 1000,
+			taskDuration:     10 * time.Millisecond,
 			variableExec:     false,
 			highParallelism:  true,
 		},
 		
-		// Medium load scenarios
+		// Six server scenarios with different workload characteristics
 		{
-			name:             "MediumLoad_LowParallelism",
-			providerCount:    5,
-			serversPerProvider: 3,
-			tasksPerProvider: 500,
-			taskDuration:     2 * time.Millisecond,
-			variableExec:     true,
-			highParallelism:  false,
-		},
-		{
-			name:             "MediumLoad_HighParallelism",
-			providerCount:    5,
-			serversPerProvider: 3,
-			tasksPerProvider: 500,
-			taskDuration:     2 * time.Millisecond,
+			name:             "SixServers_VariableTiming",
+			providerCount:    1,
+			serversPerProvider: 6, 
+			tasksPerProvider: 1000,
+			taskDuration:     10 * time.Millisecond,
 			variableExec:     true,
 			highParallelism:  true,
 		},
 		
-		// High load scenarios
+		// Six server scenario with multiple providers
 		{
-			name:             "HighLoad_LowParallelism",
-			providerCount:    10,
-			serversPerProvider: 4,
-			tasksPerProvider: 1000,
-			taskDuration:     1 * time.Millisecond,
-			variableExec:     true,
-			highParallelism:  false,
+			name:             "MultiProvider_SixServers",
+			providerCount:    3,
+			serversPerProvider: 2, // Total of 6 servers
+			tasksPerProvider: 500,
+			taskDuration:     10 * time.Millisecond,
+			variableExec:     false,
+			highParallelism:  true,
 		},
+		
+		// High volume scenario
 		{
-			name:             "HighLoad_HighParallelism",
-			providerCount:    10,
-			serversPerProvider: 4,
-			tasksPerProvider: 1000,
-			taskDuration:     1 * time.Millisecond,
-			variableExec:     true,
+			name:             "HighVolume_SixServers",
+			providerCount:    1,
+			serversPerProvider: 6,
+			tasksPerProvider: 5000,
+			taskDuration:     5 * time.Millisecond,
+			variableExec:     false,
 			highParallelism:  true,
 		},
 	}
@@ -119,7 +139,7 @@ func BenchmarkComprehensiveConfig(b *testing.B) {
 					providerName := fmt.Sprintf("provider%d", i)
 					
 					// Create provider with appropriate execution time based on scenario
-					provider := &BenchProvider{
+					provider := &CompBenchProvider{
 						name: providerName,
 						taskDuration: scenario.taskDuration,
 						variableExec: scenario.variableExec,
@@ -178,13 +198,12 @@ func BenchmarkComprehensiveConfig(b *testing.B) {
 									taskID := fmt.Sprintf("task-%d-%d-%d", i, providerIndex, t)
 									priority := t % 10
 									
-									task := &BenchTask{
+									task := &CompBenchTask{
 										id:         taskID,
 										priority:   priority,
 										provider:   provider,
 										maxRetries: 3,
 										createdAt:  time.Now(),
-										// Removed batch key
 										server:     fmt.Sprintf("server-%d-%d", providerIndex, t%scenario.serversPerProvider),
 										onCompleteFn: func() {
 											completedTasks <- struct{}{}
@@ -205,13 +224,12 @@ func BenchmarkComprehensiveConfig(b *testing.B) {
 								taskID := fmt.Sprintf("task-%d-%d-%d", i, p, t)
 								priority := t % 10
 								
-								task := &BenchTask{
+								task := &CompBenchTask{
 									id:         taskID,
 									priority:   priority,
 									provider:   provider,
 									maxRetries: 3,
 									createdAt:  time.Now(),
-									// Removed batch key
 									server:     fmt.Sprintf("server-%d-%d", p, t%scenario.serversPerProvider),
 									onCompleteFn: func() {
 										completedTasks <- struct{}{}
@@ -251,18 +269,18 @@ func BenchmarkComprehensiveConfig(b *testing.B) {
 	}
 }
 
-// BenchProvider implements IProvider for benchmarking
-type BenchProvider struct {
+// CompBenchProvider implements IProvider for benchmarking
+type CompBenchProvider struct {
 	name         string
 	taskDuration time.Duration
 	variableExec bool
 }
 
-func (p *BenchProvider) Name() string {
+func (p *CompBenchProvider) Name() string {
 	return p.name
 }
 
-func (p *BenchProvider) Handle(task ITask, server string) error {
+func (p *CompBenchProvider) Handle(task ITask, server string) error {
 	duration := p.taskDuration
 	
 	// Add variability to execution time if needed
@@ -280,8 +298,8 @@ func (p *BenchProvider) Handle(task ITask, server string) error {
 	return nil
 }
 
-// BenchTask implements ITask and ServerBatchableTask for benchmarking
-type BenchTask struct {
+// CompBenchTask implements ITask and ServerBatchableTask for benchmarking
+type CompBenchTask struct {
 	id           string
 	priority     int
 	provider     IProvider
@@ -291,78 +309,75 @@ type BenchTask struct {
 	createdAt    time.Time
 	completed    bool
 	failed       bool
-	// Removed batch key
 	server       string
 	mu           sync.Mutex
 	onCompleteFn func()
 }
 
-func (t *BenchTask) MarkAsSuccess(execTime int64) {
+func (t *CompBenchTask) MarkAsSuccess(execTime int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.completed = true
 }
 
-func (t *BenchTask) MarkAsFailed(execTime int64, err error) {
+func (t *CompBenchTask) MarkAsFailed(execTime int64, err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.failed = true
 	t.completed = true
 }
 
-func (t *BenchTask) GetPriority() int {
+func (t *CompBenchTask) GetPriority() int {
 	return t.priority
 }
 
-func (t *BenchTask) GetID() string {
+func (t *CompBenchTask) GetID() string {
 	return t.id
 }
 
-func (t *BenchTask) GetMaxRetries() int {
+func (t *CompBenchTask) GetMaxRetries() int {
 	return t.maxRetries
 }
 
-func (t *BenchTask) GetRetries() int {
+func (t *CompBenchTask) GetRetries() int {
 	return t.retries
 }
 
-func (t *BenchTask) GetCreatedAt() time.Time {
+func (t *CompBenchTask) GetCreatedAt() time.Time {
 	return t.createdAt
 }
 
-func (t *BenchTask) GetTaskGroup() ITaskGroup {
+func (t *CompBenchTask) GetTaskGroup() ITaskGroup {
 	return nil
 }
 
-func (t *BenchTask) GetProvider() IProvider {
+func (t *CompBenchTask) GetProvider() IProvider {
 	return t.provider
 }
 
-func (t *BenchTask) UpdateRetries(r int) error {
+func (t *CompBenchTask) UpdateRetries(r int) error {
 	t.retries = r
 	return nil
 }
 
-func (t *BenchTask) GetTimeout() time.Duration {
+func (t *CompBenchTask) GetTimeout() time.Duration {
 	return t.timeout
 }
 
-func (t *BenchTask) UpdateLastError(s string) error {
+func (t *CompBenchTask) UpdateLastError(s string) error {
 	return nil
 }
 
-func (t *BenchTask) GetCallbackName() string {
+func (t *CompBenchTask) GetCallbackName() string {
 	return "benchmark"
 }
 
-func (t *BenchTask) OnComplete() {
+func (t *CompBenchTask) OnComplete() {
 	t.completed = true
 	if t.onCompleteFn != nil {
 		t.onCompleteFn()
 	}
 }
 
-func (t *BenchTask) OnStart() {
+func (t *CompBenchTask) OnStart() {
 }
-
-// Removed batching interface implementation

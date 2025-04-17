@@ -284,10 +284,11 @@ func (sd *ServerDispatcher) Shutdown() {
 
 // TwoLevelDispatchManager manages two-level dispatching
 type TwoLevelDispatchManager struct {
-	providers      map[string]*ProviderDispatcher
-	providerLock   sync.RWMutex
-	taskManager    *TaskManagerSimple
-	enabled        bool
+	providers        map[string]*ProviderDispatcher
+	providerLock     sync.RWMutex
+	taskManager      *TaskManagerSimple
+	enabled          bool
+	serverSelectFunc func([]string) string
 }
 
 // NewTwoLevelDispatchManager creates a new two-level dispatch manager
@@ -356,7 +357,13 @@ func (tdm *TwoLevelDispatchManager) EnqueueTaskWithServerSelection(task ITask, s
 		return false
 	}
 	
-	pd.EnqueueTaskToAll(task, selectServer)
+	// Use provided selector or fall back to default
+	serverSelector := selectServer
+	if serverSelector == nil {
+		serverSelector = tdm.GetServerSelectionFunc()
+	}
+	
+	pd.EnqueueTaskToAll(task, serverSelector)
 	return true
 }
 
@@ -378,4 +385,23 @@ func (tdm *TwoLevelDispatchManager) SetEnabled(enabled bool) {
 // IsEnabled returns whether two-level dispatching is enabled
 func (tdm *TwoLevelDispatchManager) IsEnabled() bool {
 	return tdm.enabled
+}
+
+// SetServerSelectionFunc sets the server selection function
+func (tdm *TwoLevelDispatchManager) SetServerSelectionFunc(selectFunc func([]string) string) {
+	tdm.serverSelectFunc = selectFunc
+}
+
+// GetServerSelectionFunc returns the current server selection function
+func (tdm *TwoLevelDispatchManager) GetServerSelectionFunc() func([]string) string {
+	if tdm.serverSelectFunc == nil {
+		// Default server selection function - prioritize first server
+		return func(servers []string) string {
+			if len(servers) == 0 {
+				return ""
+			}
+			return servers[0]
+		}
+	}
+	return tdm.serverSelectFunc
 }
