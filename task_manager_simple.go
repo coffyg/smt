@@ -125,11 +125,13 @@ func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, l
 			PreWarmAsync: true,  // Pre-warm in background to avoid startup delay
 		},
 
-		// Adaptive timeout settings - enabled based on benchmarks for variable workloads
-		// BenchmarkAdaptiveTimeoutTimeoutScenarios/WithAdaptiveTimeout_FrequentTimeouts shows ~14% improvement
-		EnableAdaptiveTimeout: true,
+		// Adaptive timeout settings disabled by default for maximum performance
+		// Comprehensive benchmarks showed MemPool_TwoLevel is faster than AllFeatures
+		// Enable this manually when dealing with highly variable workloads
+		EnableAdaptiveTimeout: false,
 
 		// Two-level dispatching settings - enabled based on benchmarks for better scalability
+		// Provides ~4.5x improvement in performance for six server configurations
 		EnableTwoLevel: true,
 	})
 }
@@ -945,7 +947,7 @@ func InitTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, tasks 
 	// Create a new task manager with benchmarked optimal configuration
 	TaskQueueManagerInstance = NewTaskManagerSimple(providers, servers, logger, getTimeout)
 	TaskQueueManagerInstance.Start()
-	logger.Info().Msg("[tms] Task manager started with optimal configuration (memory pooling, adaptive timeouts, and two-level dispatching)")
+	logger.Info().Msg("[tms] Task manager started with optimal performance configuration (memory pooling and two-level dispatching)")
 
 	// Signal that the TaskManager is ready
 	taskManagerCond.Broadcast()
