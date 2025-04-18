@@ -89,10 +89,7 @@ type TaskManagerSimple struct {
 
 	// Removed background task compaction code based on benchmark results
 
-	// Adaptive timeout settings
-	adaptiveTimeout     *AdaptiveTimeoutManager            // Manages adaptive timeouts
-	originalTimeoutFunc func(string, string) time.Duration // Original timeout function
-	adaptiveTimeoutStop chan struct{}                      // Channel to signal adaptive timeout worker to stop
+	// Removed adaptive timeout functionality
 
 	// Two-level dispatching settings
 	twoLevelDispatch *TwoLevelDispatchManager // Manages two-level dispatching
@@ -125,11 +122,6 @@ func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, l
 			PreWarmAsync: true,  // Pre-warm in background to avoid startup delay
 		},
 
-		// Adaptive timeout settings disabled by default for maximum performance
-		// Comprehensive benchmarks showed MemPool_TwoLevel is faster than AllFeatures
-		// Enable this manually when dealing with highly variable workloads
-		EnableAdaptiveTimeout: false,
-
 		// Two-level dispatching settings - enabled based on benchmarks for better scalability
 		// Provides ~4.5x improvement in performance for six server configurations
 		EnableTwoLevel: true,
@@ -142,8 +134,8 @@ type TaskManagerOptions struct {
 	EnablePooling   bool       // Whether to enable memory pooling for task wrappers
 	PoolConfig      *PoolConfig // Configuration options for the memory pool
 
-	// Adaptive timeout settings
-	EnableAdaptiveTimeout bool // Whether to enable adaptive timeouts
+	// Adaptive timeout settings - keeping field for backward compatibility
+	EnableAdaptiveTimeout bool // Whether to enable adaptive timeouts - DEPRECATED, NO LONGER USED
 
 	// Two-level dispatching settings
 	EnableTwoLevel bool // Whether to enable two-level dispatching
@@ -161,7 +153,6 @@ func NewTaskManagerWithPool(providers *[]IProvider, servers map[string][]string,
 		},
 		// Enable proven optimizations based on benchmarks
 		EnableTwoLevel: true,
-		EnableAdaptiveTimeout: true,
 	})
 }
 
@@ -175,6 +166,7 @@ func NewTaskManagerWithCompaction(providers *[]IProvider, servers map[string][]s
 // NewTaskManagerWithAdaptiveTimeout creates a task manager with adaptive timeout support
 // It's recommended to use NewTaskManagerSimple instead for optimal performance configuration.
 func NewTaskManagerWithAdaptiveTimeout(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string, string) time.Duration) *TaskManagerSimple {
+	logger.Warn().Msg("[tms] NewTaskManagerWithAdaptiveTimeout is deprecated, adaptive timeout removed")
 	return NewTaskManagerWithOptions(providers, servers, logger, getTimeout, &TaskManagerOptions{
 		EnablePooling: true,
 		PoolConfig: &PoolConfig{
@@ -183,7 +175,6 @@ func NewTaskManagerWithAdaptiveTimeout(providers *[]IProvider, servers map[strin
 			PreWarmAsync: true,
 		},
 		EnableTwoLevel: true,
-		EnableAdaptiveTimeout: true,
 	})
 }
 
@@ -196,27 +187,8 @@ func NewTaskManagerWithOptions(providers *[]IProvider, servers map[string][]stri
 
 	// Removed batch and compaction settings configuration
 
-	// Create adaptive timeout manager if enabled
-	adaptiveTimeoutMgr := NewAdaptiveTimeoutManager(options.EnableAdaptiveTimeout)
-
-	// Create a wrapper for the timeout function to use adaptive timeouts
-	var timeoutFunc func(string, string) time.Duration
-	if options.EnableAdaptiveTimeout {
-		// Store the original function and create a new one that uses adaptive timeouts
-		timeoutFunc = func(callback, provider string) time.Duration {
-			// Get the base timeout from the original function
-			baseTimeout := getTimeout(callback, provider)
-
-			// Register this timeout with the adaptive manager
-			adaptiveTimeoutMgr.RegisterBaseTimeout(provider, callback, baseTimeout)
-
-			// Get the adjusted timeout
-			return adaptiveTimeoutMgr.GetTimeout(callback, provider)
-		}
-	} else {
-		// Use the original timeout function
-		timeoutFunc = getTimeout
-	}
+	// Use the original timeout function directly - adaptive timeout removed
+	timeoutFunc := getTimeout
 	
 	// Initialize the memory pool if enabled
 	var taskPool *TaskWithPriorityPool
@@ -230,11 +202,8 @@ func NewTaskManagerWithOptions(providers *[]IProvider, servers map[string][]stri
 		shutdownCh:           make(chan struct{}),
 		logger:               logger,
 		getTimeout:           timeoutFunc,
-		originalTimeoutFunc:  getTimeout,
 		serverConcurrencyMap: make(map[string]chan struct{}),
 		serverConcurrencyMu:  sync.RWMutex{},
-		adaptiveTimeout:      adaptiveTimeoutMgr,
-		adaptiveTimeoutStop:  make(chan struct{}),
 		enableTwoLevel:       options.EnableTwoLevel,
 		taskPool:             taskPool,
 		enablePooling:        options.EnablePooling,
@@ -485,14 +454,6 @@ func (tm *TaskManagerSimple) Start() {
 		}
 	}
 
-	// Removed background task compaction worker
-
-	// Start background adaptive timeout worker if enabled
-	if tm.adaptiveTimeout != nil && tm.adaptiveTimeout.IsEnabled() {
-		tm.wg.Add(1)
-		go tm.startAdaptiveTimeoutWorker()
-	}
-
 	// If we have no workers (no servers), log a warning
 	if numWorkers == 0 {
 		tm.logger.Warn().Msg("[tms] Task manager started with no servers available")
@@ -575,22 +536,42 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 	// Acquire semaphore if needed
 	if hasLimit {
 		semaphore <- struct{}{}
+		defer func() {
+			<-semaphore
+		}()
 	}
 
-	defer tm.wg.Done()
+	// CRITICAL BUGFIX: Ensure the server is returned to the main pool when we're done
+	// Similar to the two-level dispatch implementation, guarantee servers are returned
+	serverReturned := false
 	defer func() {
-		// Release semaphore if needed
-		if hasLimit {
-			<-semaphore
+		// Only return the server once
+		if !serverReturned {
+			serverReturned = true
+			pd, ok := tm.providers[providerName]
+			if ok && !tm.HasShutdownRequest() {
+				expectedSize := len(pd.servers)
+				
+				// Safe server return - only return if channel isn't full
+				currentSize := len(pd.availableServers)
+				if currentSize < expectedSize {
+					select {
+					case pd.availableServers <- server:
+						// Successfully returned the server
+					default:
+						// Channel full - this should rarely happen
+						tm.logger.Warn().Msgf("[tms|%s|%s|%s] Failed to return server - channel full", 
+							providerName, taskID, server)
+					}
+				}
+			}
 		}
-
-		// Return the server to the available servers pool
-		pd, ok := tm.providers[providerName]
-		if ok {
-			pd.availableServers <- server
-		}
-		
-		// Return the task wrapper to the pool if pooling is enabled
+	}()
+	
+	defer tm.wg.Done()
+	
+	// Return the task wrapper to the pool when done
+	defer func() {
 		if tm.enablePooling && tm.taskPool != nil && taskWrapper != nil {
 			tm.taskPool.Put(taskWrapper)
 		}
@@ -687,6 +668,34 @@ func (tm *TaskManagerSimple) processTaskTwoLevel(task ITask, providerName, serve
 		}()
 	}
 	
+	// CRITICAL BUGFIX: Ensure the server is returned to the main pool when we're done
+	// This is necessary because the ServerDispatcher workers don't return servers
+	// By using a defer here, we guarantee servers are returned even in panic/error paths
+	serverReturned := false
+	defer func() {
+		// Only return the server once
+		if !serverReturned {
+			serverReturned = true
+			pd, ok := tm.providers[providerName]
+			if ok && !tm.HasShutdownRequest() {
+				expectedSize := len(pd.servers)
+				
+				// Safe server return - only return if channel isn't full
+				currentSize := len(pd.availableServers)
+				if currentSize < expectedSize {
+					select {
+					case pd.availableServers <- server:
+						// Successfully returned the server
+					default:
+						// Channel full - this should rarely happen
+						tm.logger.Warn().Msgf("[tms-twolevel|%s|%s|%s] Failed to return server - channel full", 
+							providerName, taskID, server)
+					}
+				}
+			}
+		}
+	}()
+	
 	// Return the task wrapper to the pool when done
 	defer func() {
 		if tm.enablePooling && tm.taskPool != nil && taskWrapper != nil {
@@ -782,13 +791,6 @@ func (tm *TaskManagerSimple) Shutdown() {
 	// Close shutdown channel (protected by CompareAndSwap above)
 	close(tm.shutdownCh)
 
-	// Removed compaction worker stop code
-
-	// Signal adaptive timeout worker to stop if enabled
-	if tm.adaptiveTimeout != nil && tm.adaptiveTimeout.IsEnabled() {
-		close(tm.adaptiveTimeoutStop)
-	}
-
 	// Shutdown two-level dispatch if enabled
 	if tm.enableTwoLevel && tm.twoLevelDispatch != nil {
 		tm.twoLevelDispatch.Shutdown()
@@ -876,11 +878,6 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 		execTimeMs = time.Since(startTime).Milliseconds()
 		if err == nil {
 			tm.logger.Debug().Msgf("[tms|%s|%s] Task COMPLETED on server %s, took %s", pn, task.GetID(), server, time.Since(startTime))
-
-			// Record successful execution in adaptive timeout manager
-			if tm.adaptiveTimeout != nil && tm.adaptiveTimeout.IsEnabled() {
-				tm.adaptiveTimeout.RecordExecution(pn, task.GetCallbackName(), execTimeMs, maxTimeout)
-			}
 		} else {
 			// Wrap error if it's not already a TaskError
 			if _, ok := err.(*TaskError); !ok {
@@ -895,41 +892,6 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 
 	return err, execTimeMs
 }
-
-// Background task compaction worker and related functions have been removed
-// based on benchmark results showing minimal performance benefit
-
-// startAdaptiveTimeoutWorker starts a background worker that periodically decays old timeout statistics
-func (tm *TaskManagerSimple) startAdaptiveTimeoutWorker() {
-	defer tm.wg.Done()
-
-	// Use ticker to schedule decay at regular intervals (daily)
-	decayInterval := 24 * time.Hour
-	ticker := time.NewTicker(decayInterval)
-	defer ticker.Stop()
-
-	tm.logger.Info().
-		Msg("[tms|adaptive-timeout] Adaptive timeout worker started")
-
-	for {
-		select {
-		case <-ticker.C:
-			// Decay old statistics to give more weight to recent task executions
-			if tm.adaptiveTimeout != nil {
-				tm.adaptiveTimeout.DecayOldStats()
-				tm.logger.Debug().Msg("[tms|adaptive-timeout] Decayed old execution statistics")
-			}
-		case <-tm.adaptiveTimeoutStop:
-			tm.logger.Debug().Msg("[tms|adaptive-timeout] Adaptive timeout worker stopping")
-			return
-		case <-tm.shutdownCh:
-			tm.logger.Debug().Msg("[tms|adaptive-timeout] Adaptive timeout worker stopping due to shutdown")
-			return
-		}
-	}
-}
-
-// Task queue compaction functions have been removed based on benchmark results
 
 var (
 	TaskQueueManagerInstance *TaskManagerSimple

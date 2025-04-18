@@ -89,21 +89,28 @@ func TestTaskManagerSimple_HarshEnvironment(t *testing.T) {
 					done:       make(chan struct{}),
 				}
 
-				AddTask(task, &logger)
-
-				// Wait for task to complete
-				go func(task *MockTask) {
-					<-task.done
+				// Make sure the 'done' channel is properly closed when the task completes
+				task.completionCallback = func(t *MockTask) {
 					taskStatusMutex.Lock()
-					defer taskStatusMutex.Unlock()
-					if task.failed {
-						taskFailed <- task.GetID()
-						taskStatus[task.GetID()] = "failed"
-					} else if task.success {
-						taskProcessed <- task.GetID()
-						taskStatus[task.GetID()] = "processed"
+					if t.failed {
+						select {
+						case taskFailed <- t.GetID():
+						default:
+							// Channel might be full, but we'll still mark the status
+						}
+						taskStatus[t.GetID()] = "failed"
+					} else if t.success {
+						select {
+						case taskProcessed <- t.GetID():
+						default:
+							// Channel might be full, but we'll still mark the status
+						}
+						taskStatus[t.GetID()] = "processed"
 					}
-				}(task)
+					taskStatusMutex.Unlock()
+				}
+
+				AddTask(task, &logger)
 			}
 		}(i)
 	}

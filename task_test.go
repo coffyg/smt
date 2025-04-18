@@ -10,24 +10,25 @@ import (
 // Mock implementations for testing interfaces
 
 type MockTask struct {
-	id             string
-	priority       int
-	retries        int
-	maxRetries     int
-	createdAt      time.Time
-	taskGroup      ITaskGroup
-	provider       IProvider
-	timeout        time.Duration
-	lastError      string
-	success        bool
-	failed         bool
-	startCalled    bool
-	completeCalled bool
-	successTime    int64
-	failedTime     int64
-	done           chan struct{}
-	doneOnce       sync.Once
-	callbackName   string // Custom callback name for testing
+	id                string
+	priority          int
+	retries           int
+	maxRetries        int
+	createdAt         time.Time
+	taskGroup         ITaskGroup
+	provider          IProvider
+	timeout           time.Duration
+	lastError         string
+	success           bool
+	failed            bool
+	startCalled       bool
+	completeCalled    bool
+	successTime       int64
+	failedTime        int64
+	done              chan struct{}
+	doneOnce          sync.Once
+	callbackName      string // Custom callback name for testing
+	completionCallback func(*MockTask) // Function to call during OnComplete, useful for testing
 }
 
 func (t *MockTask) MarkAsSuccess(time int64) {
@@ -91,6 +92,12 @@ func (t *MockTask) UpdateLastError(errStr string) error {
 
 func (t *MockTask) OnComplete() {
 	t.completeCalled = true
+	
+	// First run any completion callback if set
+	if t.completionCallback != nil {
+		t.completionCallback(t)
+	}
+	
 	if t.done != nil {
 		// Use sync.Once to safely close the channel only once
 		t.doneOnce.Do(func() {
