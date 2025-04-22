@@ -98,6 +98,10 @@ type TaskManagerSimple struct {
 	// Memory pooling settings
 	taskPool       *TaskWithPriorityPool     // Memory pool for TaskWithPriority objects
 	enablePooling  bool                      // Whether memory pooling is enabled
+	
+	// Pending task channels - used to ensure all tasks are processed even when servers are busy
+	pendingTaskCh   map[string]chan *TaskWithPriority // Per-provider pending task channels
+	pendingTaskMu   sync.RWMutex                      // Mutex for pendingTaskCh map
 }
 
 type ProviderData struct {
@@ -207,6 +211,8 @@ func NewTaskManagerWithOptions(providers *[]IProvider, servers map[string][]stri
 		enableTwoLevel:       options.EnableTwoLevel,
 		taskPool:             taskPool,
 		enablePooling:        options.EnablePooling,
+		pendingTaskCh:        make(map[string]chan *TaskWithPriority),
+		pendingTaskMu:        sync.RWMutex{},
 	}
 
 	// Initialize two-level dispatch manager if enabled
@@ -415,8 +421,44 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 		}
 	}
 
-	// Fallback to traditional queue if two-level dispatch failed or is disabled
-	pd.taskQueueLock.Lock()
+	// =====================================================================
+	// NEW DIRECT PROCESSING APPROACH FOR STANDARD (NON-TWO-LEVEL) DISPATCH
+	// =====================================================================
+
+	// First, try to get a server and process the task directly - this avoids
+	// potential queuing bottlenecks
+	var server string
+	var gotServer bool
+	
+	// Try non-blocking channel read to see if a server is immediately available
+	select {
+	case server, gotServer = <-pd.availableServers:
+		// Got a server, will process directly
+	default:
+		// No server immediately available
+	}
+	
+	if gotServer {
+		// We have a server, process the task directly without queueing
+		
+		// Create a task wrapper
+		var taskPriority *TaskWithPriority
+		if tm.enablePooling && tm.taskPool != nil {
+			taskPriority = tm.taskPool.GetWithTask(task, task.GetPriority())
+		} else {
+			taskPriority = &TaskWithPriority{
+				task:     task,
+				priority: task.GetPriority(),
+			}
+		}
+		
+		// Process in a new goroutine
+		tm.wg.Add(1)
+		go tm.processTask(task, providerName, server, taskPriority)
+		return true
+	}
+	
+	// If no server is available, fall back to queuing
 	
 	// Use memory pool if enabled, otherwise create a new TaskWithPriority
 	var taskPriority *TaskWithPriority
@@ -429,6 +471,18 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 		}
 	}
 	
+	// Try to add to pending channel directly if it exists
+	pendingCh := tm.getPendingTaskChannel(providerName)
+	select {
+	case pendingCh <- taskPriority:
+		// Successfully added to pending channel
+		return true
+	default:
+		// Channel full, fallback to queue
+	}
+	
+	// If the pending channel is full or doesn't exist, use the traditional queue
+	pd.taskQueueLock.Lock()
 	heap.Push(&pd.taskQueue, taskPriority)
 	pd.taskQueueCond.Signal() // Signal that a new task is available
 	pd.taskQueueLock.Unlock()
@@ -460,6 +514,30 @@ func (tm *TaskManagerSimple) Start() {
 	}
 }
 
+func (tm *TaskManagerSimple) getPendingTaskChannel(providerName string) chan *TaskWithPriority {
+	tm.pendingTaskMu.RLock()
+	ch, exists := tm.pendingTaskCh[providerName]
+	tm.pendingTaskMu.RUnlock()
+	
+	if exists {
+		return ch
+	}
+	
+	// Create a new channel if one doesn't exist
+	tm.pendingTaskMu.Lock()
+	defer tm.pendingTaskMu.Unlock()
+	
+	// Check again in case another goroutine created it
+	if ch, exists = tm.pendingTaskCh[providerName]; exists {
+		return ch
+	}
+	
+	// Create a buffered channel with capacity for at least 1000 tasks
+	ch = make(chan *TaskWithPriority, 1000)
+	tm.pendingTaskCh[providerName] = ch
+	return ch
+}
+
 func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 	defer tm.wg.Done()
 	pd := tm.providers[providerName]
@@ -468,47 +546,130 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 	taskQueue := &pd.taskQueue
 	commandQueue := pd.commandQueue
 	availableServers := pd.availableServers
-
-	for {
-		pd.taskQueueLock.Lock()
-		// Wait for tasks, commands, or shutdown
-		for taskQueue.Len() == 0 && commandQueue.Len() == 0 && !tm.HasShutdownRequest() {
-			pd.taskQueueCond.Wait()
+	
+	// Get the pending task channel for this provider
+	pendingTaskCh := tm.getPendingTaskChannel(providerName)
+	
+	// Start a separate goroutine to drain the task queue into pendingTaskCh
+	tm.wg.Add(1)
+	go func() {
+		defer tm.wg.Done()
+		
+		for !tm.HasShutdownRequest() {
+			pd.taskQueueLock.Lock()
+			// If there are tasks in the queue, move them to the pendingTaskCh
+			if taskQueue.Len() > 0 {
+				// Get the next task
+				task := heap.Pop(taskQueue).(*TaskWithPriority)
+				pd.taskQueueLock.Unlock()
+				
+				// Put task in pending channel - will block if channel is full
+				select {
+				case pendingTaskCh <- task:
+					// Successfully added to pending channel
+				case <-tm.shutdownCh:
+					return
+				}
+			} else {
+				// No tasks in queue, wait for notification
+				// Wait for tasks, commands, or shutdown
+				for taskQueue.Len() == 0 && !tm.HasShutdownRequest() {
+					pd.taskQueueCond.Wait()
+				}
+				
+				// Check for shutdown
+				if tm.HasShutdownRequest() {
+					pd.taskQueueLock.Unlock()
+					return
+				}
+				pd.taskQueueLock.Unlock()
+			}
 		}
-
-		// Check shutdown first to avoid unnecessary work
+	}()
+	
+	// Start a separate goroutine for commands
+	var pendingCommands []Command
+	
+	// Main dispatcher loop
+	for {
 		if tm.HasShutdownRequest() {
-			pd.taskQueueLock.Unlock()
 			return
 		}
-
-		var isCommand bool
-		var command Command
-		var taskWithPriority *TaskWithPriority
-
-		if taskQueue.Len() > 0 {
-			// Get the next task
-			taskWithPriority = heap.Pop(taskQueue).(*TaskWithPriority)
-			isCommand = false
-		} else if commandQueue.Len() > 0 {
-			// Dequeue the command
-			command, _ = commandQueue.Dequeue()
-			isCommand = true
-		}
-		pd.taskQueueLock.Unlock()
-
-		// Wait for an available server using select
+		
+		// Try to get a server first
+		var server string
+		var hasServer bool
+		
 		select {
 		case <-tm.shutdownCh:
 			return
-		case server := <-availableServers:
-			// We got a server, process the task or command
-			tm.wg.Add(1)
-			if isCommand {
-				go tm.processCommand(command, providerName, server)
-			} else {
-				go tm.processTask(taskWithPriority.task, providerName, server, taskWithPriority)
+		case server = <-availableServers:
+			hasServer = true
+		default:
+			// No server immediately available
+		}
+		
+		// If we have a server, process a task if available
+		if hasServer {
+			var task *TaskWithPriority
+			var hasTask bool
+			
+			// Try to get a pending task
+			select {
+			case task = <-pendingTaskCh:
+				hasTask = true
+			default:
+				// No task immediately available
 			}
+			
+			if hasTask {
+				// Process the task
+				tm.wg.Add(1)
+				go tm.processTask(task.task, providerName, server, task)
+			} else if len(pendingCommands) > 0 {
+				// Process a command if available
+				cmd := pendingCommands[0]
+				pendingCommands = pendingCommands[1:]
+				tm.wg.Add(1)
+				go tm.processCommand(cmd, providerName, server)
+			} else {
+				// Return the server if no tasks or commands
+				select {
+				case availableServers <- server:
+					// Server returned
+				default:
+					// Channel full, shouldn't happen but handle gracefully
+				}
+			}
+		}
+		
+		// Check if we need to get commands from the queue
+		if len(pendingCommands) == 0 {
+			pd.taskQueueLock.Lock()
+			for commandQueue.Len() > 0 {
+				cmd, _ := commandQueue.Dequeue()
+				pendingCommands = append(pendingCommands, cmd)
+			}
+			pd.taskQueueLock.Unlock()
+		}
+		
+		// Wait for either:
+		// 1. A server to become available
+		// 2. A new task to be added to the pending channel
+		// 3. Shutdown signal
+		select {
+		case <-tm.shutdownCh:
+			return
+		case server = <-availableServers:
+			// Got a server, process task in next loop
+			select {
+			case availableServers <- server:
+				// Return server for next iteration
+			default:
+				// Channel full, shouldn't happen
+			}
+		case <-time.After(5 * time.Millisecond):
+			// Short timeout to prevent tight loop
 		}
 	}
 }

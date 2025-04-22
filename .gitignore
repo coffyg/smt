@@ -4,3 +4,8 @@
 *.sh
 *.old
 smt.test
+test_results.txt
+test_output.txt
+test_results2.txt
+test_output.txt
+*.txt
