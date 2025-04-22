@@ -669,15 +669,14 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 				// Channel full, shouldn't happen
 			}
 		case task := <-pendingTaskCh:
-			// Got a task, try to get server in next loop
+			// Got a task, put it back for processing in the next loop
+			// This allows us to block waiting for tasks rather than polling
 			select {
 			case pendingTaskCh <- task:
-				// Return task for next iteration
+				// Return task to channel
 			default:
 				// Channel full, shouldn't happen
 			}
-		case <-time.After(100 * time.Millisecond):
-			// Much longer timeout when idle to reduce CPU usage
 		}
 	}
 }
