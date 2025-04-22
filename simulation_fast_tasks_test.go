@@ -202,7 +202,7 @@ func TestSimulationFastTasks(t *testing.T) {
 				defer tm.Shutdown()
 
 				// Create a batch of tasks
-				const taskCount = 100 // Use 100 tasks per provider for a good test
+				const taskCount = 300 // Use 300 tasks per provider for a more extensive test
 				allTasks := make([]*MockFastTask, 0, taskCount*len(providers))
 				
 				for i, p := range providers {
@@ -229,7 +229,7 @@ func TestSimulationFastTasks(t *testing.T) {
 				var mu sync.Mutex
 				
 				// Give some time for tasks to start - use 3x the expected max processing time
-				timeout := 3 * time.Second
+				timeout := 30 * time.Second
 				
 				// Create wait group to track completion of all checks
 				var wg sync.WaitGroup

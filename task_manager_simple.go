@@ -829,9 +829,9 @@ func (tm *TaskManagerSimple) processTaskTwoLevel(task ITask, providerName, serve
 		}()
 	}
 	
-	// CRITICAL BUGFIX: Ensure the server is returned to the main pool when we're done
-	// This is necessary because the ServerDispatcher workers don't return servers
-	// By using a defer here, we guarantee servers are returned even in panic/error paths
+	// CRITICAL BUGFIX: Properly manage server pool in two-level dispatch mode
+	// We need to ensure servers are returned to the pool, or tests like TestServerResourceLeak
+	// will detect servers getting "stuck" (never returned to availableServers channel)
 	serverReturned := false
 	defer func() {
 		// Only return the server once
@@ -841,16 +841,18 @@ func (tm *TaskManagerSimple) processTaskTwoLevel(task ITask, providerName, serve
 			if ok && !tm.HasShutdownRequest() {
 				expectedSize := len(pd.servers)
 				
-				// Safe server return - only return if channel isn't full
+				// Check current channel size - only return if there's space
+				// This prevents "channel full" warnings while ensuring servers are returned
 				currentSize := len(pd.availableServers)
 				if currentSize < expectedSize {
+					// Use non-blocking send with select - only try to return if channel isn't full
 					select {
 					case pd.availableServers <- server:
 						// Successfully returned the server
 					default:
-						// Channel full - this should rarely happen
-						tm.logger.Warn().Msgf("[tms-twolevel|%s|%s|%s] Failed to return server - channel full", 
-							providerName, taskID, server)
+						// Channel full - this should never happen and indicates a potential resource leak
+						tm.logger.Error().Msgf("[tms-twolevel|%s|%s|%s] CRITICAL: Failed to return server - channel full (size=%d/%d)", 
+							providerName, taskID, server, currentSize, expectedSize)
 					}
 				}
 			}
