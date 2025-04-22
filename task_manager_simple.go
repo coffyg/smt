@@ -668,8 +668,16 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 			default:
 				// Channel full, shouldn't happen
 			}
-		case <-time.After(5 * time.Millisecond):
-			// Short timeout to prevent tight loop
+		case task := <-pendingTaskCh:
+			// Got a task, try to get server in next loop
+			select {
+			case pendingTaskCh <- task:
+				// Return task for next iteration
+			default:
+				// Channel full, shouldn't happen
+			}
+		case <-time.After(100 * time.Millisecond):
+			// Much longer timeout when idle to reduce CPU usage
 		}
 	}
 }
