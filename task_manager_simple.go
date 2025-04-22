@@ -191,17 +191,28 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 		var isCommand bool
 		var command Command
 		var taskWithPriority *TaskWithPriority
+		var hasWork bool
 
 		if pd.taskQueue.Len() > 0 {
 			// Get the next task
 			taskWithPriority = heap.Pop(&pd.taskQueue).(*TaskWithPriority)
 			isCommand = false
+			hasWork = true
 		} else if pd.commandQueue.Len() > 0 {
 			// Dequeue the command
 			command, _ = pd.commandQueue.Dequeue()
 			isCommand = true
+			hasWork = true
+		} else {
+			// No work to do, go back to waiting
+			pd.taskQueueLock.Unlock()
+			continue
 		}
 		pd.taskQueueLock.Unlock()
+
+		if !hasWork {
+			continue
+		}
 
 		// Wait for an available server
 		select {
