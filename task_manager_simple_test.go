@@ -14,28 +14,48 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// Using ThreadSafeLogBuffer from test_utils.go
+
 // Test TaskManagerSimple in a harsh multi-user environment
 func TestTaskManagerSimple_HarshEnvironment(t *testing.T) {
-	// Setup logger
-	logger := log.Output(zerolog.ConsoleWriter{Out: zerolog.NewConsoleWriter().Out})
+	// Create logger with a thread-safe buffer we can check for errors
+	var logBuffer ThreadSafeLogBuffer
+	// Disable colorization to make string matching easier
+	writer := zerolog.ConsoleWriter{
+		Out:     &logBuffer,
+		NoColor: true,
+	}
+	logger := log.Output(writer)
 
 	// Define providers
 	providerNames := []string{"provider1", "provider2", "provider3", "provider4", "provider5"}
 	var providers []IProvider
 	providerHandleFuncs := make(map[string]func(task ITask, server string) error)
 
+	// Track servers assigned to tasks for verification
+	serverAssignments := sync.Map{}
+	serverReturns := sync.Map{}
+
 	for _, name := range providerNames {
 		provider := &MockProvider{name: name}
 		providers = append(providers, provider)
 
 		// Assign a handleFunc for each provider to simulate processing time and errors
+		// Also track server assignments and returns
 		providerHandleFuncs[name] = func(task ITask, server string) error {
-			taskNum, _ := strconv.Atoi(task.GetID()[4:])                // Extract numeric part from "task123"
+			taskID := task.GetID()
+			serverAssignments.Store(taskID, server) // Track which server was assigned to this task
+			
+			taskNum, _ := strconv.Atoi(taskID[4:])                // Extract numeric part from "task123"
 			time.Sleep(time.Millisecond * time.Duration(20+taskNum%50)) // Simulate processing time
+			
 			// Simulate occasional errors
 			if taskNum%17 == 0 {
 				return errors.New("simulated error")
 			}
+			
+			// On successful completion, track that server was returned
+			serverReturns.Store(taskID, server)
 			return nil
 		}
 		provider.handleFunc = providerHandleFuncs[name]
@@ -48,6 +68,12 @@ func TestTaskManagerSimple_HarshEnvironment(t *testing.T) {
 		"provider3": {"server5", "server6"},
 		"provider4": {"server7"},
 		"provider5": {"server8", "server9", "server10"},
+	}
+
+	// Count total servers for verification
+	totalServers := 0
+	for _, serverList := range servers {
+		totalServers += len(serverList)
 	}
 
 	// Define getTimeout function
@@ -146,6 +172,52 @@ Finished:
 	// Verify that all tasks have been processed
 	if processedCount+failedCount != totalTasks {
 		t.Errorf("Not all tasks were processed: processed %d, failed %d, total %d", processedCount, failedCount, totalTasks)
+	}
+
+	// Check for any "channel full" errors in the logs
+	logs := logBuffer.String()
+	if strings.Contains(logs, "Failed to return server - channel full") {
+		t.Errorf("Test detected 'channel full' errors in the logs, which should never happen")
+	}
+
+	// Verify server returns
+	verifiedReturns := 0
+	serverAssignments.Range(func(key, value interface{}) bool {
+		taskID := key.(string)
+		server := value.(string)
+		
+		// Get task status
+		taskStatusMutex.Lock()
+		status, exists := taskStatus[taskID]
+		taskStatusMutex.Unlock()
+		
+		if !exists {
+			t.Errorf("Task %s has server assignment but no status", taskID)
+			return true
+		}
+		
+		// For successful tasks, verify the server was returned
+		if status == "processed" {
+			returnedServer, ok := serverReturns.Load(taskID)
+			if !ok {
+				t.Errorf("Successful task %s did not return its server", taskID)
+			} else if returnedServer != server {
+				t.Errorf("Task %s was assigned server %s but returned server %s", 
+					taskID, server, returnedServer)
+			} else {
+				verifiedReturns++
+			}
+		}
+		
+		return true
+	})
+	
+	t.Logf("Verified server returns: %d out of %d successful tasks", verifiedReturns, processedCount)
+	
+	// Check if all successful tasks properly returned their servers
+	if verifiedReturns != processedCount {
+		t.Errorf("Not all successful tasks returned their servers: verified %d, processed %d", 
+			verifiedReturns, processedCount)
 	}
 
 	// Shutdown TaskManager

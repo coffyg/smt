@@ -250,7 +250,7 @@ func NewTaskManagerWithOptions(providers *[]IProvider, servers map[string][]stri
 			commandSet:       make(map[uuid.UUID]struct{}, 64),
 			commandSetLock:   commandSetLock,
 			servers:          serverList,
-			availableServers: make(chan string, serverCount),
+			availableServers: make(chan string, serverCount*2), // Double capacity to prevent channel full errors
 		}
 
 		// Buffer the server channel to avoid blocking
