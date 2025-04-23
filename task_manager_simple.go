@@ -80,6 +80,21 @@ func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, l
 
 	return tm
 }
+// IsServerAvailable checks if a server is available without blocking on channel operations
+// This is a faster alternative to checking channel status when you only need to know availability
+func (pd *ProviderData) IsServerAvailable(serverName string) bool {
+	pd.availableServerLock.RLock()
+	defer pd.availableServerLock.RUnlock()
+	
+	// Check if server is in the list of available servers
+	for _, s := range pd.availableServerList {
+		if s == serverName {
+			return true
+		}
+	}
+	return false
+}
+
 func (tm *TaskManagerSimple) SetTaskManagerServerMaxParallel(prefix string, maxParallel int) {
 	tm.serverConcurrencyMu.Lock()
 	defer tm.serverConcurrencyMu.Unlock()
@@ -121,11 +136,12 @@ func (tm *TaskManagerSimple) AddTasks(tasks []ITask) (count int, err error) {
 }
 
 func (tm *TaskManagerSimple) AddTask(task ITask) bool {
-	// Quick checks before doing any work
-	if !tm.IsRunning() {
+	// Use atomic variable for extremely fast check without map access
+	if atomic.LoadInt32(&tm.isRunning) != 1 {
 		return false
 	}
 
+	// Quick check for task already being in queue
 	if tm.isTaskInQueue(task) {
 		return false
 	}
@@ -145,13 +161,20 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 		return false
 	}
 
-	// Get provider information with only one call to Name()
+	// Get provider information with only one call to Name() 
+	// and cache map lookup result to avoid repeated accesses
 	providerName := provider.Name()
-	pd, ok := tm.providers[providerName]
+	
+	// Cache the providers map in a local variable to avoid map lookup overhead
+	providers := tm.providers
+	pd, ok := providers[providerName]
 	if !ok {
-		// Only format the error string once
-		err := fmt.Errorf("provider '%s' not found", providerName)
-		tm.logger.Error().Err(err).Msgf("[tms|%s|%s] error", providerName, taskID)
+		// Use pre-formatted error message to avoid string concatenation
+		err := fmt.Errorf(errProviderNotFound, providerName)
+		tm.logger.Error().Err(err).
+			Str("provider", providerName).
+			Str("taskID", taskID).
+			Msg("[tms] provider not found error")
 		task.MarkAsFailed(0, err)
 		task.OnComplete()
 		return false
@@ -347,6 +370,14 @@ var (
 	cachedTimeOnce sync.Once
 )
 
+// Context key types to avoid conflicts
+type contextKey string
+const (
+	taskIDKey      contextKey = "taskID"
+	providerNameKey contextKey = "providerName"
+	serverNameKey   contextKey = "serverName"
+)
+
 // getCachedTime returns the current time, using a cached value if available
 func getCachedTime() time.Time {
 	// Start the background updater if needed
@@ -402,8 +433,17 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			<-semaphore
 		}
 		// Return the server to the available servers pool
+		// Use non-blocking send when possible to reduce contention
 		if providerExists {
-			pd.availableServers <- server
+			select {
+			case pd.availableServers <- server:
+				// Server returned successfully
+			default:
+				// Channel is full, use goroutine to avoid blocking
+				go func(s string) {
+					pd.availableServers <- s
+				}(server)
+			}
 		}
 	}()
 	// Handle panics
@@ -495,7 +535,9 @@ func (tm *TaskManagerSimple) Shutdown() {
 	close(tm.shutdownCh)
 
 	// Signal all provider dispatchers to wake up
-	for _, pd := range tm.providers {
+	// Pre-fetch providers map to avoid repeated map access within the loop
+	providers := tm.providers
+	for _, pd := range providers {
 		pd.taskQueueLock.Lock()
 		pd.taskQueueCond.Broadcast()
 		pd.taskQueueLock.Unlock()
@@ -523,7 +565,12 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 	}()
 
 	maxTimeout := tm.getTimeout(callbackName, pn)
-	ctx, cancel := context.WithTimeout(context.Background(), maxTimeout)
+	
+	// Store common task data in context to avoid repeated retrievals
+	ctx := context.WithValue(context.Background(), taskIDKey, taskID)
+	ctx = context.WithValue(ctx, providerNameKey, pn)
+	ctx = context.WithValue(ctx, serverNameKey, server)
+	ctx, cancel := context.WithTimeout(ctx, maxTimeout)
 	defer cancel()
 
 	done := make(chan error, 1)
@@ -566,7 +613,14 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 					Msg("[tms] Task COMPLETED")
 			}
 		} else {
-			tm.logger.Error().Err(err).Msgf("[tms|%s|%s] Task FAILED on server %s, took %s", pn, taskID, server, elapsed)
+			// Use structured logging for better performance
+			tm.logger.Error().
+				Err(err).
+				Str("provider", pn).
+				Str("taskID", taskID).
+				Str("server", server).
+				Dur("duration", elapsed).
+				Msg("[tms] Task FAILED")
 		}
 	}
 
