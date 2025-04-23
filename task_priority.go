@@ -69,6 +69,9 @@ func (tq *TaskQueuePrio) Pop() interface{} {
 	// Clear pointer to help GC for large objects
 	old[n-1] = nil
 	*tq = old[0 : n-1]
+	
+	// The returned item will be handled by the consumer,
+	// who is responsible for returning it to the pool when done
 	return item
 }
 
