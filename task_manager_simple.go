@@ -214,6 +214,13 @@ func (tm *TaskManagerSimple) Start() {
 	}
 }
 
+// HasAvailableServer checks if the provider has any available servers without blocking
+func (pd *ProviderData) HasAvailableServer() bool {
+	pd.availableServerLock.RLock()
+	defer pd.availableServerLock.RUnlock()
+	return len(pd.availableServerList) > 0
+}
+
 func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 	defer tm.wg.Done()
 	// Pre-fetch provider data to avoid map lookups in the loop
@@ -452,7 +459,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			err := fmt.Errorf("panic occurred: %v\n%s", r, string(debug.Stack()))
 			tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] panic", providerName, taskID, server)
 			// Use cached value of started to avoid another time.Now() call
-			elapsed := time.Since(started)
+			now := getCachedTime()
+				elapsed := now.Sub(started)
 			task.MarkAsFailed(elapsed.Milliseconds(), err)
 			if !onCompleteCalled {
 				task.OnComplete()
@@ -467,7 +475,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 		err := fmt.Errorf("task '%s' has no provider", taskID)
 		tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] Task has no provider", providerName, taskID, server)
 		// Use cached value of started to avoid another time.Now() call
-		elapsed := time.Since(started)
+		now := getCachedTime()
+		elapsed := now.Sub(started)
 		task.MarkAsFailed(elapsed.Milliseconds(), err)
 		if !onCompleteCalled {
 			task.OnComplete()
