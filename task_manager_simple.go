@@ -127,9 +127,12 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 		return false
 	}
 
+	// Pre-fetch task information
+	taskID := task.GetID()
 	provider := task.GetProvider()
+	
 	if provider == nil {
-		err := fmt.Errorf("task '%s' has no provider", task.GetID())
+		err := fmt.Errorf("task '%s' has no provider", taskID)
 		tm.logger.Error().Err(err).Msg("[tms|nil_provider|error] error")
 		task.MarkAsFailed(0, err)
 		task.OnComplete()
@@ -141,7 +144,7 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 	pd, ok := tm.providers[providerName]
 	if !ok {
 		err := fmt.Errorf("provider '%s' not found", providerName)
-		tm.logger.Error().Err(err).Msgf("[tms|%s|%s] error", providerName, task.GetID())
+		tm.logger.Error().Err(err).Msgf("[tms|%s|%s] error", providerName, taskID)
 		task.MarkAsFailed(0, err)
 		task.OnComplete()
 		return false
@@ -150,13 +153,16 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 	// Now that the task is confirmed valid and the provider exists, set it as in queue
 	tm.setTaskInQueue(task)
 
+	// Cache task priority to avoid method call inside critical section
+	priority := task.GetPriority()
+	
 	pd.taskQueueLock.Lock()
-	defer pd.taskQueueLock.Unlock()
 	heap.Push(&pd.taskQueue, &TaskWithPriority{
 		task:     task,
-		priority: task.GetPriority(),
+		priority: priority,
 	})
 	pd.taskQueueCond.Signal() // Signal that a new task is available
+	pd.taskQueueLock.Unlock()
 
 	return true
 }
@@ -176,9 +182,65 @@ func (tm *TaskManagerSimple) Start() {
 
 func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 	defer tm.wg.Done()
+	// Pre-fetch provider data to avoid map lookups in the loop
 	pd := tm.providers[providerName]
+	shutdownCh := tm.shutdownCh
+
+	// Create a batch channel to help with server acquisition
+	// This can reduce contention when multiple tasks are ready
+	const batchSize = 4 // Small batch size to reduce latency
+	serverBatch := make([]string, 0, batchSize)
 
 	for {
+		// First check if we need to process any pending tasks with already acquired servers
+		if len(serverBatch) > 0 {
+			// Process one task with an available server from the batch
+			server := serverBatch[0]
+			serverBatch = serverBatch[1:]
+			
+			// Get the next task or command under lock
+			pd.taskQueueLock.Lock()
+			var isCommand bool
+			var command Command
+			var task ITask
+			var hasWork bool
+
+			if pd.taskQueue.Len() > 0 {
+				// Get the next task
+				taskWithPriority := heap.Pop(&pd.taskQueue).(*TaskWithPriority)
+				task = taskWithPriority.task
+				isCommand = false
+				hasWork = true
+			} else if pd.commandQueue.Len() > 0 {
+				// Dequeue the command
+				command, _ = pd.commandQueue.Dequeue()
+				isCommand = true
+				hasWork = true
+			} else {
+				// No work to do, return the server
+				pd.availableServers <- server
+				pd.taskQueueLock.Unlock()
+				continue
+			}
+			pd.taskQueueLock.Unlock()
+			
+			if hasWork {
+				tm.wg.Add(1)
+				if isCommand {
+					go tm.processCommand(command, providerName, server)
+				} else {
+					go tm.processTask(task, providerName, server)
+				}
+			}
+			continue
+		}
+
+		// No servers in batch, need to get work and wait for servers
+		var isCommand bool
+		var command Command
+		var taskWithPriority *TaskWithPriority
+		var hasWork bool
+
 		pd.taskQueueLock.Lock()
 		for pd.taskQueue.Len() == 0 && pd.commandQueue.Len() == 0 && !tm.HasShutdownRequest() {
 			pd.taskQueueCond.Wait()
@@ -187,11 +249,6 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 			pd.taskQueueLock.Unlock()
 			return
 		}
-
-		var isCommand bool
-		var command Command
-		var taskWithPriority *TaskWithPriority
-		var hasWork bool
 
 		if pd.taskQueue.Len() > 0 {
 			// Get the next task
@@ -216,7 +273,7 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 
 		// Wait for an available server
 		select {
-		case <-tm.shutdownCh:
+		case <-shutdownCh:
 			return
 		case server := <-pd.availableServers:
 			// We got a server, process the task or command
@@ -226,6 +283,21 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 			} else {
 				go tm.processTask(taskWithPriority.task, providerName, server)
 			}
+			
+			// Try to get more servers for batch processing
+			// This is non-blocking to avoid delays
+			serverCount := 0
+			for serverCount < batchSize-1 {
+				select {
+				case server := <-pd.availableServers:
+					serverBatch = append(serverBatch, server)
+					serverCount++
+				default:
+					// No more immediately available servers
+					goto DoneBatching
+				}
+			}
+		DoneBatching:
 		}
 	}
 }
@@ -233,6 +305,13 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string) {
 	started := time.Now()
 	var onCompleteCalled bool
+
+	// Pre-fetch task information to reduce repeated getter calls
+	taskID := task.GetID()
+	provider := task.GetProvider()
+
+	// Pre-fetch provider information
+	pd, providerExists := tm.providers[providerName]
 
 	// Acquire semaphore if server URL matches any prefix with concurrency limit
 	tm.serverConcurrencyMu.RLock()
@@ -256,8 +335,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			<-semaphore
 		}
 		// Return the server to the available servers pool
-		pd, ok := tm.providers[providerName]
-		if ok {
+		if providerExists {
 			pd.availableServers <- server
 		}
 	}()
@@ -265,7 +343,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 	defer func() {
 		if r := recover(); r != nil {
 			err := fmt.Errorf("panic occurred: %v\n%s", r, string(debug.Stack()))
-			tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] panic", providerName, task.GetID(), server)
+			tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] panic", providerName, taskID, server)
 			task.MarkAsFailed(time.Since(started).Milliseconds(), err)
 			if !onCompleteCalled {
 				task.OnComplete()
@@ -276,9 +354,9 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 	}()
 
 	// Ensure the task has a valid provider
-	if task.GetProvider() == nil {
-		err := fmt.Errorf("task '%s' has no provider", task.GetID())
-		tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] Task has no provider", providerName, task.GetID(), server)
+	if provider == nil {
+		err := fmt.Errorf("task '%s' has no provider", taskID)
+		tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] Task has no provider", providerName, taskID, server)
 		task.MarkAsFailed(time.Since(started).Milliseconds(), err)
 		if !onCompleteCalled {
 			task.OnComplete()
@@ -293,7 +371,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 		retries := task.GetRetries()
 		maxRetries := task.GetMaxRetries()
 		if retries >= maxRetries || err == sql.ErrNoRows {
-			tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] max retries reached", providerName, task.GetID(), server)
+			tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] max retries reached", providerName, taskID, server)
 			task.MarkAsFailed(totalTime, err)
 			if !onCompleteCalled {
 				task.OnComplete()
@@ -301,7 +379,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			}
 			tm.delTaskInQueue(task)
 		} else {
-			tm.logger.Debug().Err(err).Msgf("[tms|%s|%s|%s] retrying (%d/%d)", providerName, task.GetID(), server, retries+1, maxRetries)
+			tm.logger.Debug().Err(err).Msgf("[tms|%s|%s|%s] retrying (%d/%d)", providerName, taskID, server, retries+1, maxRetries)
 			task.UpdateRetries(retries + 1)
 			tm.delTaskInQueue(task)
 			tm.AddTask(task)
@@ -347,14 +425,17 @@ func (tm *TaskManagerSimple) Shutdown() {
 
 func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server string, handler func(ITask, string) error) (error, int64) {
 	var err error
+	taskID := task.GetID() // Cache task ID to reduce getter calls
+	callbackName := task.GetCallbackName()
+	
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic occurred: %v", r)
-			tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] panic in task", pn, task.GetID(), server)
+			tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] panic in task", pn, taskID, server)
 		}
 	}()
 
-	maxTimeout := tm.getTimeout(task.GetCallbackName(), pn)
+	maxTimeout := tm.getTimeout(callbackName, pn)
 	ctx, cancel := context.WithTimeout(context.Background(), maxTimeout)
 	defer cancel()
 
@@ -365,28 +446,31 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 		defer func() {
 			if r := recover(); r != nil {
 				err := fmt.Errorf("panic occurred in handler: %v\n%s", r, string(debug.Stack()))
-				tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] panic in handler", pn, task.GetID(), server)
+				tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] panic in handler", pn, taskID, server)
 				done <- err
 			}
 		}()
 
-		tm.logger.Debug().Msgf("[tms|%s|%s] Task STARTED on server %s", pn, task.GetID(), server)
+		tm.logger.Debug().Msgf("[tms|%s|%s] Task STARTED on server %s", pn, taskID, server)
 		done <- handler(task, server)
 	}()
 
+	var elapsed time.Duration
 	select {
 	case <-ctx.Done():
-		err = fmt.Errorf("[tms|%s|%s] Task timed out on server %s", pn, task.GetID(), server)
-		tm.logger.Error().Err(err).Msgf("[%s|%s] Task FAILED-TIMEOUT on server %s, took %s", pn, task.GetID(), server, time.Since(startTime))
+		elapsed = time.Since(startTime)
+		err = fmt.Errorf("[tms|%s|%s] Task timed out on server %s", pn, taskID, server)
+		tm.logger.Error().Err(err).Msgf("[%s|%s] Task FAILED-TIMEOUT on server %s, took %s", pn, taskID, server, elapsed)
 	case err = <-done:
+		elapsed = time.Since(startTime)
 		if err == nil {
-			tm.logger.Debug().Msgf("[tms|%s|%s] Task COMPLETED on server %s, took %s", pn, task.GetID(), server, time.Since(startTime))
+			tm.logger.Debug().Msgf("[tms|%s|%s] Task COMPLETED on server %s, took %s", pn, taskID, server, elapsed)
 		} else {
-			tm.logger.Error().Err(err).Msgf("[tms|%s|%s] Task FAILED on server %s, took %s", pn, task.GetID(), server, time.Since(startTime))
+			tm.logger.Error().Err(err).Msgf("[tms|%s|%s] Task FAILED on server %s, took %s", pn, taskID, server, elapsed)
 		}
 	}
 
-	return err, time.Since(startTime).Milliseconds()
+	return err, elapsed.Milliseconds()
 }
 
 var (
