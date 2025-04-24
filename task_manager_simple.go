@@ -43,7 +43,12 @@ type ProviderData struct {
 	commandSetLock sync.Mutex
 }
 
-func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string, string) time.Duration) *TaskManagerSimple {
+func NewTaskManagerSimple(
+	providers *[]IProvider,
+	servers map[string][]string,
+	logger *zerolog.Logger,
+	getTimeout func(string, string) time.Duration,
+) *TaskManagerSimple {
 	tm := &TaskManagerSimple{
 		providers:            make(map[string]*ProviderData),
 		isRunning:            0,
@@ -65,24 +70,28 @@ func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, l
 		pd := &ProviderData{
 			taskQueue:        TaskQueuePrio{},
 			taskQueueLock:    sync.Mutex{},
-			commandQueue:     NewCommandQueue(32), // Initialize with a reasonable capacity
+			commandQueue:     NewCommandQueue(32),
 			commandSet:       make(map[uuid.UUID]struct{}),
 			commandSetLock:   sync.Mutex{},
-			taskQueueCond:    sync.NewCond(&sync.Mutex{}),
 			servers:          serverList,
 			availableServers: make(chan string, len(serverList)),
 		}
-		for _, server := range serverList {
-			pd.availableServers <- server
+
+		// Fill the channel with all servers
+		for _, srv := range serverList {
+			pd.availableServers <- srv
 		}
+
+		// IMPORTANT: tie the condition to the same mutex used for the queue
 		pd.taskQueueCond = sync.NewCond(&pd.taskQueueLock)
+
 		tm.providers[providerName] = pd
 	}
 
 	return tm
 }
 
-// IsServerAvailable checks if a server is available without blocking on channel operations
+// IsServerAvailable checks if a server is available without blocking
 func (pd *ProviderData) IsServerAvailable(serverName string) bool {
 	pd.availableServerLock.RLock()
 	defer pd.availableServerLock.RUnlock()
@@ -113,8 +122,7 @@ func (tm *TaskManagerSimple) IsRunning() bool {
 	return atomic.LoadInt32(&tm.isRunning) == 1
 }
 
-// delTaskInQueue removes a task ID from the map. We now use this **only**
-// when we specifically intend to re-queue a task after partial failure.
+// delTaskInQueue removes a task ID from the map only when re-queueing on partial failure.
 func (tm *TaskManagerSimple) delTaskInQueue(task ITask) {
 	tm.taskInQueue.Delete(task.GetID())
 }
@@ -128,20 +136,17 @@ func (tm *TaskManagerSimple) AddTasks(tasks []ITask) (count int, err error) {
 	return count, err
 }
 
-// AddTask attempts to add a task once. If it is already known to the manager,
-// the function returns false. Otherwise it enqueues the task and returns true.
+// AddTask enqueues a task if not already known. Returns true if successfully enqueued.
 func (tm *TaskManagerSimple) AddTask(task ITask) bool {
-	// Fast check to see if manager is running
 	if atomic.LoadInt32(&tm.isRunning) != 1 {
 		return false
 	}
 
-	// Validate the task
 	taskID := task.GetID()
 	provider := task.GetProvider()
 	if provider == nil {
 		err := fmt.Errorf("task '%s' has no provider", taskID)
-		tm.logger.Error().Err(err).Msg("[tms|nil_provider|error] error")
+		tm.logger.Error().Err(err).Msg("[tms|nil_provider|error]")
 		task.MarkAsFailed(0, err)
 		task.OnComplete()
 		return false
@@ -151,23 +156,21 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 	pd, ok := tm.providers[providerName]
 	if !ok {
 		err := fmt.Errorf(errProviderNotFound, providerName)
-		tm.logger.Error().
-			Err(err).
+		tm.logger.Error().Err(err).
 			Str("provider", providerName).
 			Str("taskID", taskID).
-			Msg("[tms] provider not found error")
+			Msg("[tms] provider not found")
 		task.MarkAsFailed(0, err)
 		task.OnComplete()
 		return false
 	}
 
-	// Atomically ensure we only accept this task once
+	// If already in queue, skip
 	if _, loaded := tm.taskInQueue.LoadOrStore(taskID, struct{}{}); loaded {
-		// Already known, skip
 		return false
 	}
 
-	// Insert into provider's priority queue
+	// Push into the priority queue
 	priority := task.GetPriority()
 	twp := taskWithPriorityPool.Get().(*TaskWithPriority)
 	twp.task = task
@@ -212,13 +215,13 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 	var isCommand bool
 	var command Command
 	var task ITask
-	var hasWork bool
 	var taskWithPriority *TaskWithPriority
+	var hasWork bool
 	var server string
 	var serverCount int
 
 	for {
-		// If we have leftover servers in the local batch, use them first
+		// If we have leftover servers in the local batch, try to use them
 		if len(serverBatch) > 0 {
 			server = serverBatch[0]
 			serverBatch = serverBatch[1:]
@@ -230,16 +233,15 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 
 			pd.taskQueueLock.Lock()
 			if pd.taskQueue.Len() > 0 {
-				// Pop a task
 				taskWithPriority = heap.Pop(&pd.taskQueue).(*TaskWithPriority)
 				task = taskWithPriority.task
 				hasWork = true
 			} else if pd.commandQueue.Len() > 0 {
-				// Dequeue a command
 				command, _ = pd.commandQueue.Dequeue()
 				isCommand = true
 				hasWork = true
 			} else {
+				// No tasks or commands; return the server
 				pd.availableServers <- server
 				pd.taskQueueLock.Unlock()
 				continue
@@ -257,7 +259,7 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 			continue
 		}
 
-		// Otherwise, wait for work
+		// Otherwise, wait for tasks/commands
 		isCommand = false
 		command = Command{}
 		taskWithPriority = nil
@@ -293,25 +295,26 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 		select {
 		case <-shutdownCh:
 			if !isCommand && taskWithPriority != nil {
-				// Return it to pool
+				// Return TWP to pool
 				taskWithPriority.task = nil
 				taskWithPriorityPool.Put(taskWithPriority)
 			}
 			return
+
 		case server = <-pd.availableServers:
 			tm.wg.Add(1)
 			if isCommand {
 				go tm.processCommand(command, providerName, server)
 			} else {
 				task = taskWithPriority.task
-				// Return the struct to the pool
+				// Return TWP to pool
 				taskWithPriority.task = nil
 				taskWithPriorityPool.Put(taskWithPriority)
 
 				go tm.processTask(task, providerName, server)
 			}
 
-			// Try to grab more servers for batch usage
+			// Collect more servers into batch
 			serverCount = 0
 			serverBatch = serverBatch[:0]
 			for serverCount < batchSize-1 {
@@ -328,7 +331,7 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 	}
 }
 
-// For caching time so we don’t call time.Now() too frequently
+// Basic time-caching to avoid frequent time.Now() calls
 var (
 	cachedTime     atomic.Value
 	cachedTimeOnce sync.Once
@@ -346,11 +349,9 @@ func getCachedTime() time.Time {
 	cachedTimeOnce.Do(func() {
 		t := time.Now()
 		cachedTime.Store(t)
-
 		go func() {
 			ticker := time.NewTicker(time.Millisecond)
 			defer ticker.Stop()
-
 			for now := range ticker.C {
 				cachedTime.Store(now)
 			}
@@ -365,7 +366,6 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 
 	taskID := task.GetID()
 	provider := task.GetProvider()
-
 	pd, providerExists := tm.providers[providerName]
 
 	// Check concurrency limits
@@ -402,7 +402,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 		}
 	}()
 
-	// Recover from panics
+	// Recover from panic
 	defer func() {
 		if r := recover(); r != nil {
 			err := fmt.Errorf("panic occurred: %v\n%s", r, string(debug.Stack()))
@@ -414,43 +414,44 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 				task.OnComplete()
 				onCompleteCalled = true
 			}
-			// IMPORTANT: do NOT remove from taskInQueue if final, so duplicates don't re-add
-			// (No re-try if we panicked)
+			// We do NOT remove from taskInQueue, so duplicates can’t re-add
 		}
 	}()
 
-	// Ensure provider is valid
+	// Validate provider
 	if provider == nil {
 		err := fmt.Errorf("task '%s' has no provider", taskID)
-		tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] Task has no provider", providerName, taskID, server)
+		tm.logger.Error().Err(err).
+			Msgf("[tms|%s|%s|%s] Task has no provider", providerName, taskID, server)
 		now := getCachedTime()
 		task.MarkAsFailed(now.Sub(started).Milliseconds(), err)
 		if !onCompleteCalled {
 			task.OnComplete()
 			onCompleteCalled = true
 		}
-		// do NOT remove from map if final
 		return
 	}
 
-	// Handle with timeout
+	// Execute with timeout
 	err, totalTime := tm.HandleWithTimeout(providerName, task, server, tm.HandleTask)
 	if err != nil {
 		retries := task.GetRetries()
 		maxRetries := task.GetMaxRetries()
 		if retries >= maxRetries || err == sql.ErrNoRows {
-			// Final error
-			tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] max retries reached", providerName, taskID, server)
+			// Final failure
+			tm.logger.Error().Err(err).
+				Msgf("[tms|%s|%s|%s] max retries reached", providerName, taskID, server)
 			task.MarkAsFailed(totalTime, err)
 			if !onCompleteCalled {
 				task.OnComplete()
 				onCompleteCalled = true
 			}
-			// do NOT remove from map => ensures no duplicates
+			// Do NOT remove from inQueue => prevents re-adding duplicates
 		} else {
-			// Re-try scenario
+			// Retry scenario
 			if level := tm.logger.GetLevel(); level <= zerolog.DebugLevel {
-				tm.logger.Debug().Err(err).
+				tm.logger.Debug().
+					Err(err).
 					Str("provider", providerName).
 					Str("taskID", taskID).
 					Str("server", server).
@@ -459,8 +460,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 					Msg("[tms] retrying task")
 			}
 			task.UpdateRetries(retries + 1)
-			// We remove from map so that re-AddTask can succeed:
-			tm.delTaskInQueue(task)
+			tm.delTaskInQueue(task) // let it re-AddTask
 			tm.AddTask(task)
 		}
 	} else {
@@ -470,11 +470,10 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			task.OnComplete()
 			onCompleteCalled = true
 		}
-		// do NOT remove => ensures we never re-add
 	}
 }
 
-// HandleTask is just the direct call to provider.Handle
+// HandleTask calls provider.Handle(task, server) directly
 func (tm *TaskManagerSimple) HandleTask(task ITask, server string) error {
 	provider := task.GetProvider()
 	if provider == nil {
@@ -483,7 +482,7 @@ func (tm *TaskManagerSimple) HandleTask(task ITask, server string) error {
 	return provider.Handle(task, server)
 }
 
-// Shutdown stops all dispatchers and waits for them to exit
+// Shutdown signals and waits for all provider dispatchers
 func (tm *TaskManagerSimple) Shutdown() {
 	if !tm.IsRunning() {
 		if tm.logger.GetLevel() <= zerolog.DebugLevel {
@@ -509,7 +508,7 @@ func (tm *TaskManagerSimple) Shutdown() {
 	}
 }
 
-// HandleWithTimeout wraps the actual provider handling in a timeout context
+// HandleWithTimeout wraps the provider handler in a context timeout
 func (tm *TaskManagerSimple) HandleWithTimeout(
 	pn string,
 	task ITask,
@@ -543,13 +542,15 @@ func (tm *TaskManagerSimple) HandleWithTimeout(
 		defer func() {
 			if r := recover(); r != nil {
 				e := fmt.Errorf("panic occurred in handler: %v\n%s", r, string(debug.Stack()))
-				tm.logger.Error().Err(e).Msgf("[tms|%s|%s|%s] panic in handler", pn, taskID, server)
+				tm.logger.Error().Err(e).
+					Msgf("[tms|%s|%s|%s] panic in handler", pn, taskID, server)
 				done <- e
 			}
 		}()
 
 		if tm.logger.GetLevel() <= zerolog.DebugLevel {
-			tm.logger.Debug().Msgf("[tms|%s|%s] Task STARTED on server %s", pn, taskID, server)
+			tm.logger.Debug().
+				Msgf("[tms|%s|%s] Task STARTED on server %s", pn, taskID, server)
 		}
 		done <- handler(task, server)
 	}()
@@ -586,7 +587,6 @@ func (tm *TaskManagerSimple) HandleWithTimeout(
 				Msg("[tms] Task FAILED")
 		}
 	}
-
 	return err, elapsed.Milliseconds()
 }
 

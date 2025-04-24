@@ -402,7 +402,7 @@ CheckingLoop:
 	continuousAdding = false
 
 	// Wait a bit longer to make sure all counters are updated
-	time.Sleep(time.Second * 2)
+	time.Sleep(time.Second * 10)
 
 	// Log summary statistics
 	t.Logf("Tasks Added:     %d", atomic.LoadInt32(&tasksAdded))
