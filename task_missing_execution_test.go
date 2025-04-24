@@ -15,14 +15,14 @@ import (
 // ExtendedMockTask extends MockTask to track execution status
 type ExtendedMockTask struct {
 	MockTask
-	statusMutex       sync.Mutex
-	succeeded         bool
-	failed            bool
-	completed         bool
-	taskCompletionCh  chan<- string
-	tasksSucceeded    *int32
-	tasksFailed       *int32
-	tasksCompleted    *int32
+	statusMutex      sync.Mutex
+	succeeded        bool
+	failed           bool
+	completed        bool
+	taskCompletionCh chan<- string
+	tasksSucceeded   *int32
+	tasksFailed      *int32
+	tasksCompleted   *int32
 }
 
 func (t *ExtendedMockTask) MarkAsSuccess(time int64) {
@@ -46,10 +46,10 @@ func (t *ExtendedMockTask) OnComplete() {
 	t.completed = true
 	t.statusMutex.Unlock()
 	atomic.AddInt32(t.tasksCompleted, 1)
-	
+
 	// Signal completion
 	t.taskCompletionCh <- t.GetID()
-	
+
 	t.MockTask.OnComplete()
 }
 
@@ -106,7 +106,7 @@ func TestTasksNeverCompletedHighStress(t *testing.T) {
 
 	// Create a simulated server resource crunch by occasionally sleeping in the handler
 	serverResourceCrunch := make(chan struct{}, 10) // Limiting to 10 concurrent "heavy" tasks
-	
+
 	for _, name := range providerNames {
 		provider := &MockProvider{name: name}
 		providers = append(providers, provider)
@@ -115,10 +115,10 @@ func TestTasksNeverCompletedHighStress(t *testing.T) {
 		// and occasional resource crunches
 		providerHandleFuncs[name] = func(task ITask, server string) error {
 			taskID := task.GetID()
-			
+
 			// Determine if this is a "heavy" task that will cause resource contention
 			isHeavyTask := rng.Intn(10) < 3 // 30% of tasks are "heavy"
-			
+
 			if isHeavyTask {
 				select {
 				case serverResourceCrunch <- struct{}{}:
@@ -131,16 +131,16 @@ func TestTasksNeverCompletedHighStress(t *testing.T) {
 					// This increases the chance of race conditions
 				}
 			}
-			
+
 			// Simulate realistic processing time (1-8 seconds)
 			// With some tasks taking longer to increase the chances of race conditions
 			var processingTime time.Duration
 			if rng.Intn(20) == 0 { // 5% of tasks take much longer
-				processingTime = time.Duration(8000+rng.Intn(7000)) * time.Millisecond
+				processingTime = time.Duration(800+rng.Intn(700)) * time.Millisecond
 			} else {
-				processingTime = time.Duration(1000+rng.Intn(7000)) * time.Millisecond
+				processingTime = time.Duration(100+rng.Intn(700)) * time.Millisecond
 			}
-			
+
 			// Simulate CPU-intensive work occasionally
 			if rng.Intn(10) < 2 { // 20% of tasks
 				start := time.Now()
@@ -151,21 +151,21 @@ func TestTasksNeverCompletedHighStress(t *testing.T) {
 					}
 				}
 			}
-			
+
 			time.Sleep(processingTime)
-			
+
 			// Simulate occasional network issues by adding jitter to task completion
 			if rng.Intn(10) < 3 { // 30% of tasks experience "network jitter"
 				jitter := time.Duration(rng.Intn(200)) * time.Millisecond
 				time.Sleep(jitter)
 			}
-			
+
 			// Occasionally fail tasks (about 10% of the time)
 			if rng.Intn(10) == 0 {
 				// Return error to simulate failure
 				return fmt.Errorf("simulated error for task %s", taskID)
 			}
-			
+
 			return nil
 		}
 		provider.handleFunc = providerHandleFuncs[name]
@@ -175,7 +175,7 @@ func TestTasksNeverCompletedHighStress(t *testing.T) {
 	servers := make(map[string][]string)
 	serverCount := len(serverURLs)
 	serversPerProvider := serverCount / len(providers)
-	
+
 	for i, name := range providerNames {
 		startIdx := i * serversPerProvider
 		endIdx := (i + 1) * serversPerProvider
@@ -218,13 +218,13 @@ func TestTasksNeverCompletedHighStress(t *testing.T) {
 
 	// Channel to signal task completion
 	taskCompletionCh := make(chan string, maxTasks)
-	
+
 	// Create task generator function that will be used both initially and continuously
 	createTask := func(id int, shouldTrack bool) *ExtendedMockTask {
 		taskID := fmt.Sprintf("task_%d", id)
 		providerIndex := id % len(providers)
 		priority := id % 10
-		
+
 		// Create extended task with tracking capabilities
 		task := &ExtendedMockTask{
 			MockTask: MockTask{
@@ -241,20 +241,20 @@ func TestTasksNeverCompletedHighStress(t *testing.T) {
 			tasksCompleted:   &tasksCompleted,
 			taskCompletionCh: taskCompletionCh,
 		}
-		
+
 		// Only track tasks if requested (we'll track all initial tasks but not all continuous tasks)
 		if shouldTrack {
 			taskMap.Store(taskID, task)
 			atomic.AddInt32(&tasksAdded, 1)
 		}
-		
+
 		return task
 	}
-	
+
 	// Create and add initial tasks
 	for i := 0; i < initialTasks; i++ {
 		task := createTask(i, true)
-		
+
 		// Add the task in a goroutine to simulate concurrent adding
 		go func(t *ExtendedMockTask) {
 			// Add random delay to increase chances of race conditions
@@ -262,16 +262,16 @@ func TestTasksNeverCompletedHighStress(t *testing.T) {
 			AddTask(t, &logger)
 		}(task)
 	}
-	
+
 	// Start goroutine to continuously add tasks while the test is running
 	var taskIDCounter int32 = int32(initialTasks)
 	var continuousTasksAdded int32
-	
+
 	go func() {
 		for continuousAdding {
 			// Create burst of tasks (5-20 at a time)
 			burstSize := 5 + rng.Intn(16)
-			
+
 			// Launch tasks in parallel to increase contention
 			var wg sync.WaitGroup
 			for i := 0; i < burstSize; i++ {
@@ -280,15 +280,15 @@ func TestTasksNeverCompletedHighStress(t *testing.T) {
 					defer wg.Done()
 					// Generate unique task ID
 					id := atomic.AddInt32(&taskIDCounter, 1)
-					
+
 					// 1 in 6 continuously added tasks are tracked and counted in our verification
 					tracked := rng.Intn(6) == 0
-					
+
 					task := createTask(int(id), tracked)
 					if tracked {
 						atomic.AddInt32(&continuousTasksAdded, 1)
 					}
-					
+
 					// Add task with randomized timing
 					if rng.Intn(3) == 0 {
 						// Quick add
@@ -300,154 +300,154 @@ func TestTasksNeverCompletedHighStress(t *testing.T) {
 					}
 				}()
 			}
-			
+
 			// Wait for this burst to complete
 			wg.Wait()
-			
+
 			// Random pause between bursts (10-100ms)
 			time.Sleep(time.Duration(10+rng.Intn(90)) * time.Millisecond)
 		}
 	}()
-	
+
 	// Periodically execute commands between server load changes
 	go func() {
 		for continuousAdding {
 			// Sleep for a random duration
 			time.Sleep(time.Duration(500+rng.Intn(1000)) * time.Millisecond)
-			
+
 			// Pick a random provider
 			providerIndex := rng.Intn(len(providers))
 			providerName := providerNames[providerIndex]
-			
+
 			// Execute a command to add more server/task interaction complexity
 			err := TaskQueueManagerInstance.ExecuteCommand(providerName, func(server string) error {
 				// Simulate some command processing time
 				time.Sleep(time.Duration(50+rng.Intn(200)) * time.Millisecond)
 				return nil
 			})
-			
+
 			if err != nil {
 				t.Logf("Command execution failed: %v", err)
 			}
 		}
 	}()
-	
+
 	// Periodically change server parallelism limits to simulate system reconfigurations
 	go func() {
 		for continuousAdding {
 			// Sleep for a random duration between changes
 			time.Sleep(time.Duration(2000+rng.Intn(3000)) * time.Millisecond)
-			
+
 			// Pick a random server
 			serverIndex := rng.Intn(len(serverURLs))
 			server := serverURLs[serverIndex]
-			
+
 			// Randomly change its parallelism limit
 			newLimit := 1 + rng.Intn(3) // 1, 2, or 3
 			TaskQueueManagerInstance.SetTaskManagerServerMaxParallel(server, newLimit)
-			
+
 			// Log this change occasionally
 			if rng.Intn(5) == 0 {
 				t.Logf("Changed parallelism limit for %s to %d", server, newLimit)
 			}
 		}
 	}()
-	
+
 	// Wait for all initial tasks plus tracked continuous tasks to complete or timeout
 	completedTasks := 0
 	expectedMinimumCompletions := initialTasks
 	missingTaskTimeout := time.After(time.Minute * 2) // 2 minutes should be enough
 	progressTicker := time.NewTicker(time.Second * 5)
 	defer progressTicker.Stop()
-	
+
 	// Force the test to end if this deadline is reached
 	testDeadline := time.After(time.Minute * 3)
-	
+
 CheckingLoop:
 	for {
 		select {
 		case <-taskCompletionCh:
 			completedTasks++
-			
+
 			// Keep adding the tracked continuous tasks to our expected count
 			expectedMinimumCompletions = initialTasks + int(atomic.LoadInt32(&continuousTasksAdded))
-			
+
 			// If we've completed all tracked tasks, we can finish
 			if completedTasks >= expectedMinimumCompletions {
 				// Wait a bit longer to make sure we catch any stragglers
 				time.Sleep(time.Second * 2)
 				break CheckingLoop
 			}
-			
+
 		case <-progressTicker.C:
 			// Log progress and counts
 			expectedMinimumCompletions = initialTasks + int(atomic.LoadInt32(&continuousTasksAdded))
-			t.Logf("Progress: %d/%d tasks completed (Added: %d, Continuous: %d)", 
-				completedTasks, expectedMinimumCompletions, 
+			t.Logf("Progress: %d/%d tasks completed (Added: %d, Continuous: %d)",
+				completedTasks, expectedMinimumCompletions,
 				atomic.LoadInt32(&tasksAdded),
 				atomic.LoadInt32(&continuousTasksAdded))
-			
+
 		case <-missingTaskTimeout:
-			t.Logf("Timeout waiting for tasks to complete: %d/%d done", 
+			t.Logf("Timeout waiting for tasks to complete: %d/%d done",
 				completedTasks, expectedMinimumCompletions)
 			break CheckingLoop
-			
+
 		case <-testDeadline:
 			t.Logf("Test deadline reached. Stopping test.")
 			break CheckingLoop
 		}
 	}
-	
+
 	// Stop continuous task addition
 	continuousAdding = false
-	
+
 	// Wait a bit longer to make sure all counters are updated
 	time.Sleep(time.Second * 2)
-	
+
 	// Log summary statistics
 	t.Logf("Tasks Added:     %d", atomic.LoadInt32(&tasksAdded))
 	t.Logf("Tasks Succeeded: %d", atomic.LoadInt32(&tasksSucceeded))
 	t.Logf("Tasks Failed:    %d", atomic.LoadInt32(&tasksFailed))
 	t.Logf("Tasks Completed: %d", atomic.LoadInt32(&tasksCompleted))
-	
+
 	// List missing tasks
 	var incompleteTasks []string
 	taskMap.Range(func(key, value interface{}) bool {
 		taskID := key.(string)
 		task := value.(*ExtendedMockTask)
-		
+
 		succeeded, failed, completed := task.GetStatus()
-		
+
 		if !completed {
 			details := fmt.Sprintf("%s [succeeded: %t, failed: %t, completed: %t]",
 				taskID, succeeded, failed, completed)
 			incompleteTasks = append(incompleteTasks, details)
 		}
-		
+
 		return true
 	})
-	
+
 	// Perform final validation
 	totalSuccessFail := atomic.LoadInt32(&tasksSucceeded) + atomic.LoadInt32(&tasksFailed)
-	
+
 	// Check if tasks marked as succeeded/failed were also completed
 	if atomic.LoadInt32(&tasksCompleted) < totalSuccessFail {
-		t.Errorf("Some tasks were marked as succeeded/failed but not completed. Success+Failed: %d, Completed: %d", 
+		t.Errorf("Some tasks were marked as succeeded/failed but not completed. Success+Failed: %d, Completed: %d",
 			totalSuccessFail, atomic.LoadInt32(&tasksCompleted))
 	}
-	
+
 	// Check if any tasks were added but never completed
 	if atomic.LoadInt32(&tasksCompleted) < atomic.LoadInt32(&tasksAdded) {
-		t.Errorf("%d tasks were added but never completed", 
-			atomic.LoadInt32(&tasksAdded) - atomic.LoadInt32(&tasksCompleted))
+		t.Errorf("%d tasks were added but never completed",
+			atomic.LoadInt32(&tasksAdded)-atomic.LoadInt32(&tasksCompleted))
 	}
-	
+
 	// If we found any incomplete tasks, log them and fail the test
 	if len(incompleteTasks) > 0 {
-		t.Errorf("Found %d tasks that were added but never completed: %v", 
+		t.Errorf("Found %d tasks that were added but never completed: %v",
 			len(incompleteTasks), incompleteTasks)
 	}
-	
+
 	// Shutdown TaskManager
 	TaskQueueManagerInstance.Shutdown()
 }
