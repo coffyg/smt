@@ -445,8 +445,11 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			if !onCompleteCalled {
 				task.OnComplete()
 				onCompleteCalled = true
+				taskManagerMutex.Lock()
+				tm.taskInQueue.Delete(taskID)
+				taskManagerMutex.Unlock()
 			}
-			// Do NOT remove from inQueue => prevents re-adding duplicates
+
 		} else {
 			// Retry scenario
 			if level := tm.logger.GetLevel(); level <= zerolog.DebugLevel {
@@ -469,6 +472,9 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 		if !onCompleteCalled {
 			task.OnComplete()
 			onCompleteCalled = true
+			taskManagerMutex.Lock()
+			tm.taskInQueue.Delete(taskID)
+			taskManagerMutex.Unlock()
 		}
 	}
 }
