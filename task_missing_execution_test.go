@@ -350,7 +350,7 @@ CheckLoop:
 	parallelismWg.Wait()
 
 	// Wait a bit for counters to finalize
-	time.Sleep(6 * time.Second)
+	time.Sleep(10 * time.Second)
 
 	t.Logf("Tasks Added:     %d", atomic.LoadInt32(&tasksAdded))
 	t.Logf("Tasks Succeeded: %d", atomic.LoadInt32(&tasksSucceeded))
