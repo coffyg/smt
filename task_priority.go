@@ -16,15 +16,15 @@ type TaskWithPriority struct {
 type TaskQueuePrio []*TaskWithPriority
 
 // Len returns the length of the queue
-func (tq TaskQueuePrio) Len() int { 
-	return len(tq) 
+func (tq TaskQueuePrio) Len() int {
+	return len(tq)
 }
 
 // Less compares priority values - higher values have higher priority
 func (tq TaskQueuePrio) Less(i, j int) bool {
 	// Higher priority tasks come first
 	if tq[i].priority == tq[j].priority {
-		// If priorities are equal, older tasks come first 
+		// If priorities are equal, older tasks come first
 		// (assuming lower indexes were added earlier)
 		return tq[i].index < tq[j].index
 	}
@@ -44,39 +44,34 @@ func (tq *TaskQueuePrio) Push(x interface{}) {
 	// Preallocate when growing near capacity
 	capNeeded := cap(*tq)
 	if n >= capNeeded {
-		// Grow to at least 1.5x (better than Go default 2x for this use case)
+		// Grow to at least 1.5x
 		newCap := capNeeded*3/2 + 1
 		if capNeeded == 0 {
-			newCap = 8 // Start with 8 for very small queues
+			newCap = 8 // Start with capacity=8 for very small queues
 		}
-		// Create new slice with increased capacity
 		newSlice := make([]*TaskWithPriority, n, newCap)
 		copy(newSlice, *tq)
 		*tq = newSlice
 	}
-	
+
 	item := x.(*TaskWithPriority)
 	item.index = n
 	*tq = append(*tq, item)
 }
 
-// Pop removes and returns the highest priority task
+// Pop removes and returns the highest-priority task
 func (tq *TaskQueuePrio) Pop() interface{} {
 	old := *tq
 	n := len(old)
 	item := old[n-1]
-	item.index = -1 // For safety
-	// Clear pointer to help GC for large objects
-	old[n-1] = nil
-	*tq = old[0 : n-1]
-	
-	// The returned item will be handled by the consumer,
-	// who is responsible for returning it to the pool when done
+
+	item.index = -1 // reset index
+	old[n-1] = nil  // help GC
+	*tq = old[:n-1]
 	return item
 }
 
 // Update modifies the priority of a task in the queue
-// More efficient than removing and re-adding
 func (tq *TaskQueuePrio) Update(item *TaskWithPriority, priority int) {
 	item.priority = priority
 	// After changing the priority, we need to restore the heap property

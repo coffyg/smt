@@ -70,7 +70,7 @@ func NewTaskManagerSimple(
 		pd := &ProviderData{
 			taskQueue:        TaskQueuePrio{},
 			taskQueueLock:    sync.Mutex{},
-			commandQueue:     NewCommandQueue(32),
+			commandQueue:     NewCommandQueue(32), // user code for CommandQueue (assumed present)
 			commandSet:       make(map[uuid.UUID]struct{}),
 			commandSetLock:   sync.Mutex{},
 			servers:          serverList,
@@ -122,7 +122,18 @@ func (tm *TaskManagerSimple) IsRunning() bool {
 	return atomic.LoadInt32(&tm.isRunning) == 1
 }
 
-// delTaskInQueue removes a task ID from the map only when re-queueing on partial failure.
+// Helper methods for thread-safe taskInQueue operations
+func (tm *TaskManagerSimple) isTaskInQueue(taskID string) bool {
+	_, exists := tm.taskInQueue.Load(taskID)
+	return exists
+}
+
+func (tm *TaskManagerSimple) addTaskToQueue(taskID string) bool {
+	_, loaded := tm.taskInQueue.LoadOrStore(taskID, struct{}{})
+	return !loaded // Returns true if task was added, false if it was already there
+}
+
+// delTaskInQueue removes a task ID from the map
 func (tm *TaskManagerSimple) delTaskInQueue(task ITask) {
 	tm.taskInQueue.Delete(task.GetID())
 }
@@ -139,6 +150,7 @@ func (tm *TaskManagerSimple) AddTasks(tasks []ITask) (count int, err error) {
 // AddTask enqueues a task if not already known. Returns true if successfully enqueued.
 func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 	if atomic.LoadInt32(&tm.isRunning) != 1 {
+		// Manager not running; cannot queue
 		return false
 	}
 
@@ -165,8 +177,8 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 		return false
 	}
 
-	// If already in queue, skip
-	if _, loaded := tm.taskInQueue.LoadOrStore(taskID, struct{}{}); loaded {
+	// Use our thread-safe helper method
+	if !tm.addTaskToQueue(taskID) {
 		return false
 	}
 
@@ -242,8 +254,8 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 				hasWork = true
 			} else {
 				// No tasks or commands; return the server
-				pd.availableServers <- server
 				pd.taskQueueLock.Unlock()
+				pd.availableServers <- server
 				continue
 			}
 			pd.taskQueueLock.Unlock()
@@ -395,6 +407,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			select {
 			case pd.availableServers <- server:
 			default:
+				// Non-blocking fallback: spawn a goroutine to return the server
 				go func(s string) {
 					pd.availableServers <- s
 				}(server)
@@ -414,7 +427,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 				task.OnComplete()
 				onCompleteCalled = true
 			}
-			// We do NOT remove from taskInQueue, so duplicates can’t re-add
+			// We intentionally do NOT remove from taskInQueue here
+			// so we don't allow a duplicate to be re-added externally.
 		}
 	}()
 
@@ -440,16 +454,13 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 		if retries >= maxRetries || err == sql.ErrNoRows {
 			// Final failure
 			tm.logger.Error().Err(err).
-				Msgf("[tms|%s|%s|%s] max retries reached", providerName, taskID, server)
+				Msgf("[tms|%s|%s|%s] max retries reached or no rows", providerName, taskID, server)
 			task.MarkAsFailed(totalTime, err)
 			if !onCompleteCalled {
 				task.OnComplete()
 				onCompleteCalled = true
-				taskManagerMutex.Lock()
-				tm.taskInQueue.Delete(taskID)
-				taskManagerMutex.Unlock()
 			}
-
+			tm.delTaskInQueue(task)
 		} else {
 			// Retry scenario
 			if level := tm.logger.GetLevel(); level <= zerolog.DebugLevel {
@@ -463,7 +474,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 					Msg("[tms] retrying task")
 			}
 			task.UpdateRetries(retries + 1)
-			tm.delTaskInQueue(task) // let it re-AddTask
+			// remove from the in-queue set so it can be re-added
+			tm.delTaskInQueue(task)
 			tm.AddTask(task)
 		}
 	} else {
@@ -472,10 +484,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 		if !onCompleteCalled {
 			task.OnComplete()
 			onCompleteCalled = true
-			taskManagerMutex.Lock()
-			tm.taskInQueue.Delete(taskID)
-			taskManagerMutex.Unlock()
 		}
+		tm.delTaskInQueue(task)
 	}
 }
 
@@ -598,9 +608,10 @@ func (tm *TaskManagerSimple) HandleWithTimeout(
 
 var (
 	TaskQueueManagerInstance *TaskManagerSimple
-	taskManagerMutex         sync.Mutex
-	taskManagerCond          = sync.NewCond(&taskManagerMutex)
-	addMaxRetries            = 3
+	// Only used to guard TaskQueueManagerInstance creation/usage:
+	taskManagerMutex sync.Mutex
+	taskManagerCond  = sync.NewCond(&taskManagerMutex)
+	addMaxRetries    = 3
 
 	// Pool for TaskWithPriority objects
 	taskWithPriorityPool = sync.Pool{
@@ -627,13 +638,13 @@ func InitTaskQueueManager(
 ) {
 	taskManagerMutex.Lock()
 	defer taskManagerMutex.Unlock()
+
 	logger.Info().Msg("[tms] Task manager initialization")
 
 	TaskQueueManagerInstance = NewTaskManagerSimple(providers, servers, logger, getTimeout)
 	TaskQueueManagerInstance.Start()
-	logger.Info().Msg("[tms] Task manager started")
 
-	// Signal that the TaskManager is ready
+	logger.Info().Msg("[tms] Task manager started")
 	taskManagerCond.Broadcast()
 
 	// Requeue any uncompleted tasks
