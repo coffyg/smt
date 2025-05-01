@@ -380,19 +380,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 	provider := task.GetProvider()
 	pd, providerExists := tm.providers[providerName]
 
-	// Check concurrency limits
-	tm.serverConcurrencyMu.RLock()
-	var semaphore chan struct{}
-	var hasLimit bool
-	for prefix, sem := range tm.serverConcurrencyMap {
-		if strings.HasPrefix(server, prefix) {
-			semaphore = sem
-			hasLimit = true
-			break
-		}
-	}
-	tm.serverConcurrencyMu.RUnlock()
-
+	// Acquire concurrency limit if any
+	semaphore, hasLimit := tm.getServerSemaphore(server)
 	if hasLimit {
 		semaphore <- struct{}{}
 	}
@@ -403,19 +392,10 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			<-semaphore
 		}
 		// Return the server to the pool
-		if providerExists {
-			select {
-			case pd.availableServers <- server:
-			default:
-				// Non-blocking fallback: spawn a goroutine to return the server
-				go func(s string) {
-					pd.availableServers <- s
-				}(server)
-			}
-		}
+		tm.returnServerToPool(providerExists, pd, server)
 	}()
 
-	// Recover from panic
+	// Recover from panic ...
 	defer func() {
 		if r := recover(); r != nil {
 			err := fmt.Errorf("panic occurred: %v\n%s", r, string(debug.Stack()))
@@ -427,8 +407,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 				task.OnComplete()
 				onCompleteCalled = true
 			}
-			// We intentionally do NOT remove from taskInQueue here
-			// so we don't allow a duplicate to be re-added externally.
+			tm.delTaskInQueue(task)
 		}
 	}()
 
@@ -443,6 +422,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			task.OnComplete()
 			onCompleteCalled = true
 		}
+		tm.delTaskInQueue(task)
 		return
 	}
 
@@ -474,8 +454,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 					Msg("[tms] retrying task")
 			}
 			task.UpdateRetries(retries + 1)
-			// remove from the in-queue set so it can be re-added
-			tm.delTaskInQueue(task)
+			tm.delTaskInQueue(task) // remove so it can be re-added
 			tm.AddTask(task)
 		}
 	} else {
@@ -496,6 +475,33 @@ func (tm *TaskManagerSimple) HandleTask(task ITask, server string) error {
 		return fmt.Errorf("task '%s' has no provider", task.GetID())
 	}
 	return provider.Handle(task, server)
+}
+func (tm *TaskManagerSimple) returnServerToPool(providerExists bool, pd *ProviderData, server string) {
+	if !providerExists {
+		return
+	}
+	select {
+	case pd.availableServers <- server:
+	default:
+		// fallback to a goroutine if the channel is full
+		go func(s string) {
+			pd.availableServers <- s
+		}(server)
+	}
+}
+
+// getServerSemaphore checks if the server has a concurrency limit.
+func (tm *TaskManagerSimple) getServerSemaphore(server string) (chan struct{}, bool) {
+	tm.serverConcurrencyMu.RLock()
+	defer tm.serverConcurrencyMu.RUnlock()
+
+	// If the server URL or name starts with a known prefix, return that semaphore
+	for prefix, sem := range tm.serverConcurrencyMap {
+		if strings.HasPrefix(server, prefix) {
+			return sem, true
+		}
+	}
+	return nil, false
 }
 
 // Shutdown signals and waits for all provider dispatchers

@@ -134,7 +134,7 @@ func TestTasksNeverCompletedHighStress(t *testing.T) {
 			// Possibly simulate CPU load
 			if localRng.Intn(10) < 2 {
 				start := time.Now()
-				for time.Since(start) < 50*time.Millisecond {
+				for time.Since(start) < 10*time.Millisecond {
 					for i := 0; i < 1000000; i++ {
 						_ = i * i
 					}
@@ -196,8 +196,8 @@ func TestTasksNeverCompletedHighStress(t *testing.T) {
 		TaskQueueManagerInstance.SetTaskManagerServerMaxParallel(url, limit)
 	}
 
-	initialTasks := 500
-	taskCompletionCh := make(chan string, 2000)
+	initialTasks := 5000
+	taskCompletionCh := make(chan string, 200000)
 
 	// We'll use both 'continuousAdding' and a new 'testRunning'
 	var continuousAdding int32 = 1

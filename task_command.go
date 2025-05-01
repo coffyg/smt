@@ -49,25 +49,36 @@ func (tm *TaskManagerSimple) ExecuteCommand(providerName string, commandFunc fun
 
 func (tm *TaskManagerSimple) processCommand(command Command, providerName, server string) {
 	defer tm.wg.Done()
+
+	// Acquire concurrency limit if any
+	semaphore, hasLimit := tm.getServerSemaphore(server)
+	if hasLimit {
+		semaphore <- struct{}{}
+	}
+
+	// Always release semaphore & return server
 	defer func() {
-		// Return the server to the available servers pool
-		pd, ok := tm.providers[providerName]
-		if ok {
-			pd.availableServers <- server
+		if hasLimit {
+			<-semaphore
+		}
+		if pd, ok := tm.providers[providerName]; ok {
+			tm.returnServerToPool(true, pd, server)
 			// Remove the command from the tracking set
 			pd.commandSetLock.Lock()
 			delete(pd.commandSet, command.id)
 			pd.commandSetLock.Unlock()
 		}
 	}()
-	// Handle panics
+
+	// Recover from panic
 	defer func() {
 		if r := recover(); r != nil {
 			err := fmt.Errorf("panic occurred: %v\n%s", r, string(debug.Stack()))
 			tm.logger.Error().Err(err).Msgf("[tms|%s|command|%s] panic", providerName, server)
 		}
 	}()
-	// Handle command with timeout
+
+	// Run the command with a timeout
 	err, totalTime := tm.HandleCommandWithTimeout(providerName, command, server)
 	if err != nil {
 		tm.logger.Error().Err(err).Msgf("[tms|%s|command|%s] error", providerName, server)
