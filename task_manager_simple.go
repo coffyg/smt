@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -380,18 +381,33 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 	provider := task.GetProvider()
 	pd, providerExists := tm.providers[providerName]
 
-	// Acquire concurrency limit if any
+	// 1) Acquire concurrency FIRST (this can block until there's space).
 	semaphore, hasLimit := tm.getServerSemaphore(server)
 	if hasLimit {
-		semaphore <- struct{}{}
+		tm.logger.Debug().
+			Str("server", server).
+			Str("taskID", taskID).
+			Msg("[tms|processTask] Waiting for concurrency slot...")
+
+		semaphore <- struct{}{} // blocks if no slot free
+
+		tm.logger.Debug().
+			Str("server", server).
+			Str("taskID", taskID).
+			Msg("[tms|processTask] Acquired concurrency slot!")
 	}
 
 	defer tm.wg.Done()
 	defer func() {
+		// 4) Always release concurrency when done
 		if hasLimit {
 			<-semaphore
+			tm.logger.Debug().
+				Str("server", server).
+				Str("taskID", taskID).
+				Msg("[tms|processTask] Released concurrency slot!")
 		}
-		// Return the server to the pool
+		// Return server to the pool
 		tm.returnServerToPool(providerExists, pd, server)
 	}()
 
@@ -426,7 +442,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 		return
 	}
 
-	// Execute with timeout
+	// 2) Now that concurrency is acquired, we start the actual timed work:
 	err, totalTime := tm.HandleWithTimeout(providerName, task, server, tm.HandleTask)
 	if err != nil {
 		retries := task.GetRetries()
@@ -492,6 +508,14 @@ func (tm *TaskManagerSimple) returnServerToPool(providerExists bool, pd *Provide
 
 // getServerSemaphore checks if the server has a concurrency limit.
 func (tm *TaskManagerSimple) getServerSemaphore(server string) (chan struct{}, bool) {
+	// Optional: parse out query, to unify concurrency for any query string
+	if u, err := url.Parse(server); err == nil {
+		// Remove query and fragment, so "https://foo?x=1" => "https://foo"
+		u.RawQuery = ""
+		u.Fragment = ""
+		server = u.String()
+	}
+
 	tm.serverConcurrencyMu.RLock()
 	defer tm.serverConcurrencyMu.RUnlock()
 
