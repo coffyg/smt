@@ -596,8 +596,13 @@ func (tm *TaskManagerSimple) HandleWithTimeout(
 
 		if tm.logger.GetLevel() <= zerolog.DebugLevel {
 			tm.logger.Debug().
-				Msgf("[tms|%s|%s] Task STARTED on server %s", pn, taskID, server)
+				Str("provider", pn).
+				Str("taskID", taskID).
+				Str("server", server).
+				Msg("[tms|HandleWithTimeout] Task STARTED")
 		}
+
+		// Actually run the provider's handle
 		done <- handler(task, server)
 	}()
 
