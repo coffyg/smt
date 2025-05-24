@@ -369,22 +369,13 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			// Return server to pool
 			tm.returnServerToPool(providerExists, pd, server)
 			
-			// Check if task has been retried too many times
-			retries := task.GetRetries()
-			if retries >= task.GetMaxRetries() {
-				tm.logger.Error().
-					Str("taskID", taskID).
-					Int("retries", retries).
-					Msg("[tms|processTask] Task exceeded max retries due to concurrency limits")
-				task.MarkAsFailed(0, fmt.Errorf("exceeded max retries due to concurrency limits"))
-				task.OnComplete()
-				tm.delTaskInQueue(task)
-				return
-			}
-			
-			// Increment retry counter and re-queue
-			task.UpdateRetries(retries + 1)
+			// Re-queue without incrementing retry counter
+			// Concurrency limits shouldn't count as failures
 			tm.delTaskInQueue(task)
+			
+			// Add small backoff to prevent tight loop
+			time.Sleep(5 * time.Millisecond)
+			
 			tm.AddTask(task)
 			return
 		}
