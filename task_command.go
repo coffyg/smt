@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -43,6 +44,7 @@ func (tm *TaskManagerSimple) ExecuteCommand(providerName string, commandFunc fun
 		id:          cmdID,
 		commandFunc: commandFunc,
 	})
+	atomic.AddInt32(&pd.commandCount, 1)
 	pd.taskQueueCond.Signal()
 	return nil
 }
@@ -50,10 +52,23 @@ func (tm *TaskManagerSimple) ExecuteCommand(providerName string, commandFunc fun
 func (tm *TaskManagerSimple) processCommand(command Command, providerName, server string) {
 	defer tm.wg.Done()
 
-	// Acquire concurrency limit if any
+	// Acquire concurrency limit if any (non-blocking)
 	semaphore, hasLimit := tm.getServerSemaphore(server)
 	if hasLimit {
-		semaphore <- struct{}{}
+		select {
+		case semaphore <- struct{}{}:
+			// Acquired successfully
+		default:
+			// Return server and don't re-queue command (let caller retry if needed)
+			if pd, ok := tm.providers[providerName]; ok {
+				tm.returnServerToPool(true, pd, server)
+			}
+			tm.logger.Warn().
+				Str("provider", providerName).
+				Str("server", server).
+				Msg("[tms|processCommand] Command dropped due to concurrency limit")
+			return
+		}
 	}
 
 	// Always release semaphore & return server

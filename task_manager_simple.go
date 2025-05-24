@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
@@ -19,7 +20,8 @@ import (
 // TaskManagerSimple interface (optimized)
 type TaskManagerSimple struct {
 	providers            map[string]*ProviderData
-	taskInQueue          sync.Map
+	taskInQueue          map[string]struct{}
+	taskInQueueMu        sync.RWMutex
 	isRunning            int32
 	shutdownRequest      int32
 	shutdownCh           chan struct{}
@@ -36,8 +38,8 @@ type ProviderData struct {
 	taskQueueCond       *sync.Cond
 	servers             []string
 	availableServers    chan string
-	availableServerList []string
-	availableServerLock sync.RWMutex
+	taskCount           int32 // atomic counter for tasks
+	commandCount        int32 // atomic counter for commands
 
 	commandQueue   *CommandQueue
 	commandSet     map[uuid.UUID]struct{}
@@ -52,6 +54,7 @@ func NewTaskManagerSimple(
 ) *TaskManagerSimple {
 	tm := &TaskManagerSimple{
 		providers:            make(map[string]*ProviderData),
+		taskInQueue:          make(map[string]struct{}),
 		isRunning:            0,
 		shutdownRequest:      0,
 		shutdownCh:           make(chan struct{}),
@@ -69,13 +72,13 @@ func NewTaskManagerSimple(
 			serverList = []string{}
 		}
 		pd := &ProviderData{
-			taskQueue:        TaskQueuePrio{},
+			taskQueue:        make(TaskQueuePrio, 0, 1024), // Pre-allocate for better performance
 			taskQueueLock:    sync.Mutex{},
-			commandQueue:     NewCommandQueue(32), // user code for CommandQueue (assumed present)
+			commandQueue:     NewCommandQueue(256), // Increased initial capacity to reduce resizing
 			commandSet:       make(map[uuid.UUID]struct{}),
 			commandSetLock:   sync.Mutex{},
 			servers:          serverList,
-			availableServers: make(chan string, len(serverList)),
+			availableServers: make(chan string, len(serverList)*2), // Double buffer for re-queuing scenarios
 		}
 
 		// Fill the channel with all servers
@@ -92,18 +95,6 @@ func NewTaskManagerSimple(
 	return tm
 }
 
-// IsServerAvailable checks if a server is available without blocking
-func (pd *ProviderData) IsServerAvailable(serverName string) bool {
-	pd.availableServerLock.RLock()
-	defer pd.availableServerLock.RUnlock()
-
-	for _, s := range pd.availableServerList {
-		if s == serverName {
-			return true
-		}
-	}
-	return false
-}
 
 func (tm *TaskManagerSimple) SetTaskManagerServerMaxParallel(prefix string, maxParallel int) {
 	tm.serverConcurrencyMu.Lock()
@@ -125,18 +116,28 @@ func (tm *TaskManagerSimple) IsRunning() bool {
 
 // Helper methods for thread-safe taskInQueue operations
 func (tm *TaskManagerSimple) isTaskInQueue(taskID string) bool {
-	_, exists := tm.taskInQueue.Load(taskID)
+	tm.taskInQueueMu.RLock()
+	_, exists := tm.taskInQueue[taskID]
+	tm.taskInQueueMu.RUnlock()
 	return exists
 }
 
 func (tm *TaskManagerSimple) addTaskToQueue(taskID string) bool {
-	_, loaded := tm.taskInQueue.LoadOrStore(taskID, struct{}{})
-	return !loaded // Returns true if task was added, false if it was already there
+	tm.taskInQueueMu.Lock()
+	if _, exists := tm.taskInQueue[taskID]; exists {
+		tm.taskInQueueMu.Unlock()
+		return false // Task already in queue
+	}
+	tm.taskInQueue[taskID] = struct{}{}
+	tm.taskInQueueMu.Unlock()
+	return true // Task was added
 }
 
 // delTaskInQueue removes a task ID from the map
 func (tm *TaskManagerSimple) delTaskInQueue(task ITask) {
-	tm.taskInQueue.Delete(task.GetID())
+	tm.taskInQueueMu.Lock()
+	delete(tm.taskInQueue, task.GetID())
+	tm.taskInQueueMu.Unlock()
 }
 
 func (tm *TaskManagerSimple) AddTasks(tasks []ITask) (count int, err error) {
@@ -192,6 +193,7 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 
 	pd.taskQueueLock.Lock()
 	heap.Push(&pd.taskQueue, twp)
+	atomic.AddInt32(&pd.taskCount, 1)
 	pd.taskQueueCond.Signal()
 	pd.taskQueueLock.Unlock()
 
@@ -210,12 +212,6 @@ func (tm *TaskManagerSimple) Start() {
 	}
 }
 
-// HasAvailableServer checks if the provider has any available servers without blocking
-func (pd *ProviderData) HasAvailableServer() bool {
-	pd.availableServerLock.RLock()
-	defer pd.availableServerLock.RUnlock()
-	return len(pd.availableServerList) > 0
-}
 
 func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 	defer tm.wg.Done()
@@ -231,7 +227,6 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 	var taskWithPriority *TaskWithPriority
 	var hasWork bool
 	var server string
-	var serverCount int
 
 	for {
 		// If we have leftover servers in the local batch, try to use them
@@ -247,10 +242,12 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 			pd.taskQueueLock.Lock()
 			if pd.taskQueue.Len() > 0 {
 				taskWithPriority = heap.Pop(&pd.taskQueue).(*TaskWithPriority)
+				atomic.AddInt32(&pd.taskCount, -1)
 				task = taskWithPriority.task
 				hasWork = true
 			} else if pd.commandQueue.Len() > 0 {
 				command, _ = pd.commandQueue.Dequeue()
+				atomic.AddInt32(&pd.commandCount, -1)
 				isCommand = true
 				hasWork = true
 			} else {
@@ -278,25 +275,29 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 		taskWithPriority = nil
 		hasWork = false
 
-		pd.taskQueueLock.Lock()
-		for pd.taskQueue.Len() == 0 && pd.commandQueue.Len() == 0 && !tm.HasShutdownRequest() {
-			pd.taskQueueCond.Wait()
-		}
-		if tm.HasShutdownRequest() {
+		// Fast path: check atomic counters first
+		if atomic.LoadInt32(&pd.taskCount) == 0 && atomic.LoadInt32(&pd.commandCount) == 0 {
+			pd.taskQueueLock.Lock()
+			// Double-check under lock
+			for pd.taskQueue.Len() == 0 && pd.commandQueue.Len() == 0 && !tm.HasShutdownRequest() {
+				pd.taskQueueCond.Wait()
+			}
 			pd.taskQueueLock.Unlock()
-			return
+			if tm.HasShutdownRequest() {
+				return
+			}
 		}
 
+		pd.taskQueueLock.Lock()
 		if pd.taskQueue.Len() > 0 {
 			taskWithPriority = heap.Pop(&pd.taskQueue).(*TaskWithPriority)
+			atomic.AddInt32(&pd.taskCount, -1)
 			hasWork = true
 		} else if pd.commandQueue.Len() > 0 {
 			command, _ = pd.commandQueue.Dequeue()
+			atomic.AddInt32(&pd.commandCount, -1)
 			isCommand = true
 			hasWork = true
-		} else {
-			pd.taskQueueLock.Unlock()
-			continue
 		}
 		pd.taskQueueLock.Unlock()
 
@@ -327,28 +328,10 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 				go tm.processTask(task, providerName, server)
 			}
 
-			// Collect more servers into batch
-			serverCount = 0
-			serverBatch = serverBatch[:0]
-			for serverCount < batchSize-1 {
-				select {
-				case s := <-pd.availableServers:
-					serverBatch = append(serverBatch, s)
-					serverCount++
-				default:
-					goto doneBatch
-				}
-			}
-		doneBatch:
+			// Skip server batching to reduce complexity
 		}
 	}
 }
-
-// Basic time-caching to avoid frequent time.Now() calls
-var (
-	cachedTime     atomic.Value
-	cachedTimeOnce sync.Once
-)
 
 type contextKey string
 
@@ -358,43 +341,53 @@ const (
 	serverNameKey   contextKey = "serverName"
 )
 
-func getCachedTime() time.Time {
-	cachedTimeOnce.Do(func() {
-		t := time.Now()
-		cachedTime.Store(t)
-		go func() {
-			ticker := time.NewTicker(time.Millisecond)
-			defer ticker.Stop()
-			for now := range ticker.C {
-				cachedTime.Store(now)
-			}
-		}()
-	})
-	return cachedTime.Load().(time.Time)
-}
-
 func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string) {
-	started := getCachedTime()
+	started := time.Now()
 	var onCompleteCalled bool
 
 	taskID := task.GetID()
 	provider := task.GetProvider()
 	pd, providerExists := tm.providers[providerName]
 
-	// 1) Acquire concurrency FIRST (this can block until there's space).
+	// 1) Acquire concurrency FIRST (non-blocking with retry).
 	semaphore, hasLimit := tm.getServerSemaphore(server)
 	if hasLimit {
-		tm.logger.Debug().
-			Str("server", server).
-			Str("taskID", taskID).
-			Msg("[tms|processTask] Waiting for concurrency slot...")
-
-		semaphore <- struct{}{} // blocks if no slot free
-
-		tm.logger.Debug().
-			Str("server", server).
-			Str("taskID", taskID).
-			Msg("[tms|processTask] Acquired concurrency slot!")
+		// Try to acquire non-blocking first
+		select {
+		case semaphore <- struct{}{}:
+			tm.logger.Debug().
+				Str("server", server).
+				Str("taskID", taskID).
+				Msg("[tms|processTask] Acquired concurrency slot immediately!")
+		default:
+			// If blocked, return server and re-queue task
+			tm.logger.Debug().
+				Str("server", server).
+				Str("taskID", taskID).
+				Msg("[tms|processTask] Concurrency limit reached, re-queuing task")
+			
+			// Return server to pool
+			tm.returnServerToPool(providerExists, pd, server)
+			
+			// Check if task has been retried too many times
+			retries := task.GetRetries()
+			if retries >= task.GetMaxRetries() {
+				tm.logger.Error().
+					Str("taskID", taskID).
+					Int("retries", retries).
+					Msg("[tms|processTask] Task exceeded max retries due to concurrency limits")
+				task.MarkAsFailed(0, fmt.Errorf("exceeded max retries due to concurrency limits"))
+				task.OnComplete()
+				tm.delTaskInQueue(task)
+				return
+			}
+			
+			// Increment retry counter and re-queue
+			task.UpdateRetries(retries + 1)
+			tm.delTaskInQueue(task)
+			tm.AddTask(task)
+			return
+		}
 	}
 
 	defer tm.wg.Done()
@@ -416,7 +409,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 		if r := recover(); r != nil {
 			err := fmt.Errorf("panic occurred: %v\n%s", r, string(debug.Stack()))
 			tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] panic", providerName, taskID, server)
-			now := getCachedTime()
+			now := time.Now()
 			elapsed := now.Sub(started)
 			task.MarkAsFailed(elapsed.Milliseconds(), err)
 			if !onCompleteCalled {
@@ -432,7 +425,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 		err := fmt.Errorf("task '%s' has no provider", taskID)
 		tm.logger.Error().Err(err).
 			Msgf("[tms|%s|%s|%s] Task has no provider", providerName, taskID, server)
-		now := getCachedTime()
+		now := time.Now()
 		task.MarkAsFailed(now.Sub(started).Milliseconds(), err)
 		if !onCompleteCalled {
 			task.OnComplete()
@@ -496,14 +489,8 @@ func (tm *TaskManagerSimple) returnServerToPool(providerExists bool, pd *Provide
 	if !providerExists {
 		return
 	}
-	select {
-	case pd.availableServers <- server:
-	default:
-		// fallback to a goroutine if the channel is full
-		go func(s string) {
-			pd.availableServers <- s
-		}(server)
-	}
+	// Always block to ensure server is returned
+	pd.availableServers <- server
 }
 
 // getServerSemaphore checks if the server has a concurrency limit.
@@ -539,11 +526,14 @@ func (tm *TaskManagerSimple) Shutdown() {
 	atomic.StoreInt32(&tm.shutdownRequest, 1)
 	close(tm.shutdownCh)
 
-	// Wake all dispatchers
+	// Wake dispatchers one by one to avoid thundering herd
 	for _, pd := range tm.providers {
 		pd.taskQueueLock.Lock()
-		pd.taskQueueCond.Broadcast()
+		// Signal instead of Broadcast to wake one at a time
+		pd.taskQueueCond.Signal()
 		pd.taskQueueLock.Unlock()
+		// Small delay to stagger wakeups
+		time.Sleep(1 * time.Millisecond)
 	}
 
 	tm.wg.Wait()
@@ -582,7 +572,7 @@ func (tm *TaskManagerSimple) HandleWithTimeout(
 	defer cancel()
 
 	done := make(chan error, 1)
-	startTime := getCachedTime()
+	startTime := time.Now()
 
 	go func() {
 		defer func() {
@@ -609,14 +599,14 @@ func (tm *TaskManagerSimple) HandleWithTimeout(
 	var elapsed time.Duration
 	select {
 	case <-ctx.Done():
-		now := getCachedTime()
+		now := time.Now()
 		elapsed = now.Sub(startTime)
 		err = fmt.Errorf(errTaskTimeout, pn, taskID, server)
 		tm.logger.Error().
 			Err(err).
 			Msgf("[%s|%s] Task FAILED-TIMEOUT on server %s, took %s", pn, taskID, server, elapsed)
 	case e := <-done:
-		now := getCachedTime()
+		now := time.Now()
 		elapsed = now.Sub(startTime)
 		err = e
 		if err == nil {
@@ -676,8 +666,11 @@ func InitTaskQueueManager(
 
 	logger.Info().Msg("[tms] Task manager initialization")
 
-	TaskQueueManagerInstance = NewTaskManagerSimple(providers, servers, logger, getTimeout)
-	TaskQueueManagerInstance.Start()
+	tm := NewTaskManagerSimple(providers, servers, logger, getTimeout)
+	tm.Start()
+	
+	// Use atomic store for lock-free access
+	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&TaskQueueManagerInstance)), unsafe.Pointer(tm))
 
 	logger.Info().Msg("[tms] Task manager started")
 	taskManagerCond.Broadcast()
@@ -694,28 +687,18 @@ func RequeueTaskIfNeeded(logger *zerolog.Logger, tasks []ITask) {
 
 // AddTask is the global helper for adding tasks
 func AddTask(task ITask, logger *zerolog.Logger) {
-	if TaskQueueManagerInstance == nil || TaskQueueManagerInstance.HasShutdownRequest() {
+	// Fast path: check if manager exists without lock
+	tm := (*TaskManagerSimple)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&TaskQueueManagerInstance))))
+	if tm == nil {
 		return
 	}
-	tries := 0
-	for {
-		if tries >= addMaxRetries {
-			logger.Debug().Msg("[tms|add-task] Task not added, max retries reached")
-			return
-		}
-		taskManagerMutex.Lock()
-		for TaskQueueManagerInstance == nil || !TaskQueueManagerInstance.IsRunning() {
-			taskManagerCond.Wait()
-		}
-		tmInstance := TaskQueueManagerInstance
-		taskManagerMutex.Unlock()
-
-		if added := tmInstance.AddTask(task); !added {
-			logger.Debug().Msg("[tms|add-task] Task not added, retrying")
-			time.Sleep(250 * time.Millisecond)
-			tries++
-			continue
-		}
-		break
+	
+	if tm.HasShutdownRequest() {
+		return
+	}
+	
+	// Direct add without retries for duplicates
+	if !tm.AddTask(task) {
+		logger.Debug().Str("taskID", task.GetID()).Msg("[tms|add-task] Task not added (duplicate)")
 	}
 }
