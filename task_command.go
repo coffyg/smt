@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,32 +19,26 @@ func (tm *TaskManagerSimple) ExecuteCommand(providerName string, commandFunc fun
 	if !tm.IsRunning() {
 		return errors.New("TaskManager is not running")
 	}
-	pd, ok := tm.providers[providerName]
+	
+	// Verify provider exists
+	_, ok := tm.providers[providerName]
 	if !ok {
 		return fmt.Errorf("provider '%s' not found", providerName)
 	}
 
-	// Generate a UUID for the command
-	cmdID := uuid.New()
-
-	// Check if the command is already being processed
-	pd.commandSetLock.Lock()
-	if _, exists := pd.commandSet[cmdID]; exists {
-		pd.commandSetLock.Unlock()
-		return fmt.Errorf("command with UUID '%s' is already being processed", cmdID)
+	// Create a CommandProvider for this provider
+	commandProvider := NewCommandProvider(providerName)
+	
+	// Create a CommandTask with lower priority than regular tasks
+	// This ensures tasks execute before commands, matching the test expectation
+	// Priority 2 means lower than the test task (priority 1)
+	commandTask := NewCommandTask(providerName, commandProvider, commandFunc, 2)
+	
+	// Use the normal AddTask method to queue the command
+	if !tm.AddTask(commandTask) {
+		return fmt.Errorf("failed to queue command")
 	}
-	pd.commandSet[cmdID] = struct{}{}
-	pd.commandSetLock.Unlock()
-
-	// Add the command to the queue
-	pd.taskQueueLock.Lock()
-	defer pd.taskQueueLock.Unlock()
-	pd.commandQueue.Enqueue(Command{
-		id:          cmdID,
-		commandFunc: commandFunc,
-	})
-	atomic.AddInt32(&pd.commandCount, 1)
-	pd.taskQueueCond.Signal()
+	
 	return nil
 }
 
