@@ -137,6 +137,12 @@ func (tm *TaskManagerSimple) addTaskToQueue(taskID string) bool {
 func (tm *TaskManagerSimple) delTaskInQueue(task ITask) {
 	tm.taskInQueueMu.Lock()
 	delete(tm.taskInQueue, task.GetID())
+	// Periodically recreate the map to release memory
+	// This prevents long-term memory growth from map internals
+	if len(tm.taskInQueue) == 0 {
+		// Map is empty, recreate it to release internal buckets
+		tm.taskInQueue = make(map[string]struct{})
+	}
 	tm.taskInQueueMu.Unlock()
 }
 

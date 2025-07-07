@@ -96,6 +96,31 @@ func (cq *CommandQueue) Dequeue() (Command, bool) {
 	cq.rb.head = (cq.rb.head + 1) % cq.rb.capacity
 	atomic.AddInt32(&cq.rb.count, -1)
 	
+	// Shrink buffer if it's too large and mostly empty
+	// This prevents permanent memory growth after spikes
+	currentCount := int(atomic.LoadInt32(&cq.rb.count))
+	if cq.rb.capacity > 256 && currentCount < cq.rb.capacity/4 {
+		// Shrink to 2x current size or minimum 256
+		newCapacity := currentCount * 2
+		if newCapacity < 256 {
+			newCapacity = 256
+		}
+		
+		// Create new smaller buffer
+		newBuffer := make([]Command, newCapacity)
+		
+		// Copy existing items
+		for i := 0; i < currentCount; i++ {
+			newBuffer[i] = cq.rb.buffer[(cq.rb.head+i)%cq.rb.capacity]
+		}
+		
+		// Update ring buffer
+		cq.rb.buffer = newBuffer
+		cq.rb.head = 0
+		cq.rb.tail = currentCount
+		cq.rb.capacity = newCapacity
+	}
+	
 	return cmd, true
 }
 
