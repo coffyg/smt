@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
+	"math/rand"
 	"net/url"
 	"runtime/debug"
 	"strings"
@@ -30,6 +32,7 @@ type TaskManagerSimple struct {
 	getTimeout           func(string, string) time.Duration
 	serverConcurrencyMap map[string]chan struct{} // Map of servers to semaphores
 	serverConcurrencyMu  sync.RWMutex
+	concurrencyRetryMap  sync.Map                 // Track concurrency retry attempts per task ID
 }
 
 type ProviderData struct {
@@ -169,6 +172,8 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 		tm.logger.Error().Err(err).Msg("[tms|nil_provider|error]")
 		task.MarkAsFailed(0, err)
 		task.OnComplete()
+		// Clean up concurrency retry tracking on early failure
+		tm.cleanupConcurrencyRetries(taskID)
 		return false
 	}
 
@@ -182,6 +187,8 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 			Msg("[tms] provider not found")
 		task.MarkAsFailed(0, err)
 		task.OnComplete()
+		// Clean up concurrency retry tracking on early failure
+		tm.cleanupConcurrencyRetries(taskID)
 		return false
 	}
 
@@ -379,8 +386,9 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			// Concurrency limits shouldn't count as failures
 			tm.delTaskInQueue(task)
 			
-			// Add small backoff to prevent tight loop
-			time.Sleep(5 * time.Millisecond)
+			// Calculate exponential backoff to prevent retry storms
+			backoffDelay := tm.calculateConcurrencyBackoff(taskID)
+			time.Sleep(backoffDelay)
 			
 			tm.AddTask(task)
 			return
@@ -414,6 +422,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 				onCompleteCalled = true
 			}
 			tm.delTaskInQueue(task)
+			// Clean up concurrency retry tracking on panic
+			tm.cleanupConcurrencyRetries(taskID)
 		}
 	}()
 
@@ -429,6 +439,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			onCompleteCalled = true
 		}
 		tm.delTaskInQueue(task)
+		// Clean up concurrency retry tracking on provider validation failure
+		tm.cleanupConcurrencyRetries(taskID)
 		return
 	}
 
@@ -447,6 +459,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 				onCompleteCalled = true
 			}
 			tm.delTaskInQueue(task)
+			// Clean up concurrency retry tracking on final failure
+			tm.cleanupConcurrencyRetries(taskID)
 		} else {
 			// Retry scenario
 			if level := tm.logger.GetLevel(); level <= zerolog.DebugLevel {
@@ -471,6 +485,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			onCompleteCalled = true
 		}
 		tm.delTaskInQueue(task)
+		// Clean up concurrency retry tracking on success
+		tm.cleanupConcurrencyRetries(taskID)
 	}
 }
 
@@ -510,6 +526,47 @@ func (tm *TaskManagerSimple) getServerSemaphore(server string) (chan struct{}, b
 		}
 	}
 	return nil, false
+}
+
+// calculateConcurrencyBackoff computes exponential backoff for concurrency retries
+func (tm *TaskManagerSimple) calculateConcurrencyBackoff(taskID string) time.Duration {
+	// Get current retry count (defaults to 0 if not found)
+	retriesInterface, _ := tm.concurrencyRetryMap.Load(taskID)
+	retries := 0
+	if retriesInterface != nil {
+		retries = retriesInterface.(int)
+	}
+	
+	// Increment retry count
+	tm.concurrencyRetryMap.Store(taskID, retries+1)
+	
+	// Exponential backoff: 5ms * 2^retries, capped at 800ms
+	baseDelay := 5 * time.Millisecond
+	maxDelay := 800 * time.Millisecond
+	
+	exponentialDelay := time.Duration(float64(baseDelay) * math.Pow(2, float64(retries)))
+	if exponentialDelay > maxDelay {
+		exponentialDelay = maxDelay
+	}
+	
+	// Add 0-50% jitter to prevent thundering herd
+	jitterPercent := rand.Float64() * 0.5 // 0-50%
+	jitter := time.Duration(float64(exponentialDelay) * jitterPercent)
+	
+	finalDelay := exponentialDelay + jitter
+	
+	tm.logger.Debug().
+		Str("taskID", taskID).
+		Int("concurrencyRetries", retries+1).
+		Dur("backoffDelay", finalDelay).
+		Msg("[tms] Concurrency backoff calculated")
+	
+	return finalDelay
+}
+
+// cleanupConcurrencyRetries removes tracking for completed task
+func (tm *TaskManagerSimple) cleanupConcurrencyRetries(taskID string) {
+	tm.concurrencyRetryMap.Delete(taskID)
 }
 
 // Shutdown signals and waits for all provider dispatchers
