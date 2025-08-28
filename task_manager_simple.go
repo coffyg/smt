@@ -261,6 +261,7 @@ func (tm *TaskManagerSimple) DelTask(taskID string, interruptFn func(task ITask,
 	}
 
 	// Task is queued - find and remove it from the priority queue
+	var removedTask ITask
 	removed := false
 	
 	// We need to check all providers since we don't know which one has this task
@@ -273,6 +274,9 @@ func (tm *TaskManagerSimple) DelTask(taskID string, interruptFn func(task ITask,
 				// Found it - remove from heap
 				removedItem := heap.Remove(&pd.taskQueue, i).(*TaskWithPriority)
 				atomic.AddInt32(&pd.taskCount, -1)
+				
+				// Capture the task before clearing it
+				removedTask = removedItem.task
 				
 				// Return TaskWithPriority to pool
 				removedItem.task = nil
@@ -295,7 +299,16 @@ func (tm *TaskManagerSimple) DelTask(taskID string, interruptFn func(task ITask,
 
 	if removed {
 		// Remove from taskInQueue tracking
-		tm.delTaskInQueue(&taskWrapper{id: taskID})
+		tm.delTaskInQueue(removedTask)
+		
+		// Call interrupt function even for queued tasks (server is empty since not assigned yet)
+		if interruptFn != nil {
+			err := interruptFn(removedTask, "")
+			if err != nil {
+				tm.logger.Debug().Err(err).Str("taskID", taskID).Msg("[tms|DelTask] Interrupt function returned error for queued task")
+			}
+		}
+		
 		return "removed_from_queue"
 	}
 

@@ -43,10 +43,14 @@ func TestDelTaskQueued(t *testing.T) {
 		t.Fatal("Task should be in queue")
 	}
 
-	// Create interrupt function to verify it's NOT called for queued tasks
+	// Create interrupt function to verify it's called for queued tasks with empty server
 	var interruptCalled bool
+	var taskReceived ITask
+	var serverReceived string
 	interruptFn := func(task ITask, server string) error {
 		interruptCalled = true
+		taskReceived = task
+		serverReceived = server
 		return nil
 	}
 
@@ -63,9 +67,19 @@ func TestDelTaskQueued(t *testing.T) {
 		t.Error("Task should have been removed from queue")
 	}
 
-	// Verify interrupt function was NOT called for queued task
-	if interruptCalled {
-		t.Error("Interrupt function should not be called for queued tasks")
+	// Verify interrupt function was called for queued task with empty server
+	if !interruptCalled {
+		t.Error("Interrupt function should be called for queued tasks")
+	}
+
+	if serverReceived != "" {
+		t.Errorf("Expected empty server for queued task, got '%s'", serverReceived)
+	}
+
+	if taskReceived == nil {
+		t.Error("Task should have been passed to interrupt function")
+	} else if taskReceived.GetID() != task.GetID() {
+		t.Errorf("Expected task ID '%s', got '%s'", task.GetID(), taskReceived.GetID())
 	}
 
 	// Verify task count decreased
@@ -219,9 +233,13 @@ func TestDelTaskGlobal(t *testing.T) {
 	AddTask(task, &logger)
 
 	// Delete using global function
+	var interruptCalled bool
+	var taskReceived ITask
+	var serverReceived string
 	interruptFn := func(task ITask, server string) error {
-		// This should not be called for queued task
-		t.Error("Interrupt function should not be called for queued task")
+		interruptCalled = true
+		taskReceived = task
+		serverReceived = server
 		return nil
 	}
 
@@ -229,6 +247,21 @@ func TestDelTaskGlobal(t *testing.T) {
 
 	if result != "removed_from_queue" {
 		t.Errorf("Expected 'removed_from_queue', got %s", result)
+	}
+
+	// Verify interrupt function was called for queued task with empty server
+	if !interruptCalled {
+		t.Error("Interrupt function should be called for queued tasks")
+	}
+
+	if serverReceived != "" {
+		t.Errorf("Expected empty server for queued task, got '%s'", serverReceived)
+	}
+
+	if taskReceived == nil {
+		t.Error("Task should have been passed to interrupt function")
+	} else if taskReceived.GetID() != task.GetID() {
+		t.Errorf("Expected task ID '%s', got '%s'", task.GetID(), taskReceived.GetID())
 	}
 }
 
