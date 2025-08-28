@@ -45,8 +45,9 @@ func TestDelTaskQueued(t *testing.T) {
 
 	// Create interrupt function to verify it's NOT called for queued tasks
 	var interruptCalled bool
-	interruptFn := func(server string) {
+	interruptFn := func(task ITask, server string) error {
 		interruptCalled = true
+		return nil
 	}
 
 	// Delete the queued task
@@ -123,14 +124,17 @@ func TestDelTaskRunning(t *testing.T) {
 
 	// Setup interrupt function
 	var interruptCalled bool
+	var taskReceived ITask
 	var serverReceived string
 	var wg sync.WaitGroup
 	wg.Add(1)
 	
-	interruptFn := func(server string) {
+	interruptFn := func(task ITask, server string) error {
 		defer wg.Done()
 		interruptCalled = true
+		taskReceived = task
 		serverReceived = server
+		return nil
 	}
 
 	// Delete the running task
@@ -144,13 +148,19 @@ func TestDelTaskRunning(t *testing.T) {
 	// Wait for interrupt function to be called
 	wg.Wait()
 
-	// Verify interrupt function was called with correct server
+	// Verify interrupt function was called with correct task and server
 	if !interruptCalled {
 		t.Error("Interrupt function should have been called")
 	}
 	
 	if serverReceived != "test-server-123" {
 		t.Errorf("Expected server 'test-server-123', got '%s'", serverReceived)
+	}
+	
+	if taskReceived == nil {
+		t.Error("Task should have been passed to interrupt function")
+	} else if taskReceived.GetID() != task.GetID() {
+		t.Errorf("Expected task ID '%s', got '%s'", task.GetID(), taskReceived.GetID())
 	}
 
 	// Wait a bit for task to finish/cleanup
@@ -172,8 +182,9 @@ func TestDelTaskNotFound(t *testing.T) {
 	defer tm.Shutdown()
 
 	// Try to delete non-existent task
-	interruptFn := func(server string) {
+	interruptFn := func(task ITask, server string) error {
 		t.Error("Interrupt function should not be called for non-existent task")
+		return nil
 	}
 
 	result := tm.DelTask("non-existent-id", interruptFn)
@@ -208,9 +219,10 @@ func TestDelTaskGlobal(t *testing.T) {
 	AddTask(task, &logger)
 
 	// Delete using global function
-	interruptFn := func(server string) {
+	interruptFn := func(task ITask, server string) error {
 		// This should not be called for queued task
 		t.Error("Interrupt function should not be called for queued task")
+		return nil
 	}
 
 	result := DelTask(task.GetID(), interruptFn, &logger)

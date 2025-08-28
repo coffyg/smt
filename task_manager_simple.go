@@ -22,7 +22,7 @@ import (
 // RunningTaskInfo holds information about a currently executing task
 type RunningTaskInfo struct {
 	task        ITask
-	interruptFn func(server string)
+	interruptFn func(task ITask, server string) error
 	cancelCh    chan struct{}
 	providerName string
 	server       string
@@ -227,7 +227,7 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 
 // DelTask removes a task from queue or cancels it if running
 // Returns: "removed_from_queue", "interrupted_running", "not_found", or "error"
-func (tm *TaskManagerSimple) DelTask(taskID string, interruptFn func(server string)) string {
+func (tm *TaskManagerSimple) DelTask(taskID string, interruptFn func(task ITask, server string) error) string {
 	if atomic.LoadInt32(&tm.isRunning) != 1 {
 		return "error: task manager not running"
 	}
@@ -238,12 +238,16 @@ func (tm *TaskManagerSimple) DelTask(taskID string, interruptFn func(server stri
 		// Task is currently running - set interrupt function and signal cancellation
 		runningTask.interruptFn = interruptFn
 		close(runningTask.cancelCh) // Signal the running task to cancel
+		task := runningTask.task
 		server := runningTask.server
 		tm.runningTasksMu.Unlock()
 		
-		// Call the interrupt function if provided, passing the server
+		// Call the interrupt function if provided, passing both task and server
 		if interruptFn != nil {
-			interruptFn(server)
+			err := interruptFn(task, server)
+			if err != nil {
+				tm.logger.Debug().Err(err).Str("taskID", taskID).Str("server", server).Msg("[tms|DelTask] Interrupt function returned error")
+			}
 		}
 		
 		tm.logger.Debug().Str("taskID", taskID).Str("server", server).Msg("[tms|DelTask] Interrupted running task")
@@ -911,7 +915,7 @@ func AddTask(task ITask, logger *zerolog.Logger) {
 }
 
 // DelTask is the global helper for deleting/cancelling tasks
-func DelTask(taskID string, interruptFn func(server string), logger *zerolog.Logger) string {
+func DelTask(taskID string, interruptFn func(task ITask, server string) error, logger *zerolog.Logger) string {
 	// Fast path: check if manager exists without lock
 	tm := (*TaskManagerSimple)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&TaskQueueManagerInstance))))
 	if tm == nil {
