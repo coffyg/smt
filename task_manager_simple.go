@@ -19,11 +19,22 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// RunningTaskInfo holds information about a currently executing task
+type RunningTaskInfo struct {
+	task        ITask
+	interruptFn func(server string)
+	cancelCh    chan struct{}
+	providerName string
+	server       string
+}
+
 // TaskManagerSimple interface (optimized)
 type TaskManagerSimple struct {
 	providers            map[string]*ProviderData
 	taskInQueue          map[string]struct{}
 	taskInQueueMu        sync.RWMutex
+	runningTasks         map[string]*RunningTaskInfo // Track currently executing tasks
+	runningTasksMu       sync.RWMutex
 	isRunning            int32
 	shutdownRequest      int32
 	shutdownCh           chan struct{}
@@ -58,6 +69,7 @@ func NewTaskManagerSimple(
 	tm := &TaskManagerSimple{
 		providers:            make(map[string]*ProviderData),
 		taskInQueue:          make(map[string]struct{}),
+		runningTasks:         make(map[string]*RunningTaskInfo),
 		isRunning:            0,
 		shutdownRequest:      0,
 		shutdownCh:           make(chan struct{}),
@@ -212,6 +224,123 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 
 	return true
 }
+
+// DelTask removes a task from queue or cancels it if running
+// Returns: "removed_from_queue", "interrupted_running", "not_found", or "error"
+func (tm *TaskManagerSimple) DelTask(taskID string, interruptFn func(server string)) string {
+	if atomic.LoadInt32(&tm.isRunning) != 1 {
+		return "error: task manager not running"
+	}
+
+	// First, check if task is currently running
+	tm.runningTasksMu.Lock()
+	if runningTask, exists := tm.runningTasks[taskID]; exists {
+		// Task is currently running - set interrupt function and signal cancellation
+		runningTask.interruptFn = interruptFn
+		close(runningTask.cancelCh) // Signal the running task to cancel
+		server := runningTask.server
+		tm.runningTasksMu.Unlock()
+		
+		// Call the interrupt function if provided, passing the server
+		if interruptFn != nil {
+			interruptFn(server)
+		}
+		
+		tm.logger.Debug().Str("taskID", taskID).Str("server", server).Msg("[tms|DelTask] Interrupted running task")
+		return "interrupted_running"
+	}
+	tm.runningTasksMu.Unlock()
+
+	// Task is not running, check if it's in queue
+	if !tm.isTaskInQueue(taskID) {
+		return "not_found"
+	}
+
+	// Task is queued - find and remove it from the priority queue
+	removed := false
+	
+	// We need to check all providers since we don't know which one has this task
+	for providerName, pd := range tm.providers {
+		pd.taskQueueLock.Lock()
+		
+		// Search through the priority queue
+		for i := 0; i < pd.taskQueue.Len(); i++ {
+			if pd.taskQueue[i].task.GetID() == taskID {
+				// Found it - remove from heap
+				removedItem := heap.Remove(&pd.taskQueue, i).(*TaskWithPriority)
+				atomic.AddInt32(&pd.taskCount, -1)
+				
+				// Return TaskWithPriority to pool
+				removedItem.task = nil
+				taskWithPriorityPool.Put(removedItem)
+				
+				removed = true
+				tm.logger.Debug().
+					Str("taskID", taskID).
+					Str("provider", providerName).
+					Msg("[tms|DelTask] Removed task from queue")
+				break
+			}
+		}
+		
+		pd.taskQueueLock.Unlock()
+		if removed {
+			break
+		}
+	}
+
+	if removed {
+		// Remove from taskInQueue tracking
+		tm.delTaskInQueue(&taskWrapper{id: taskID})
+		return "removed_from_queue"
+	}
+
+	return "not_found"
+}
+
+// Helper methods for running task tracking
+func (tm *TaskManagerSimple) registerRunningTask(taskID string, task ITask, providerName, server string) *RunningTaskInfo {
+	tm.runningTasksMu.Lock()
+	defer tm.runningTasksMu.Unlock()
+	
+	info := &RunningTaskInfo{
+		task:         task,
+		cancelCh:     make(chan struct{}),
+		providerName: providerName,
+		server:       server,
+	}
+	tm.runningTasks[taskID] = info
+	
+	return info
+}
+
+func (tm *TaskManagerSimple) unregisterRunningTask(taskID string) {
+	tm.runningTasksMu.Lock()
+	defer tm.runningTasksMu.Unlock()
+	
+	delete(tm.runningTasks, taskID)
+}
+
+// taskWrapper is a minimal ITask implementation for cleanup purposes
+type taskWrapper struct {
+	id string
+}
+
+func (tw *taskWrapper) GetID() string { return tw.id }
+func (tw *taskWrapper) MarkAsSuccess(t int64) {}
+func (tw *taskWrapper) MarkAsFailed(t int64, err error) {}
+func (tw *taskWrapper) GetPriority() int { return 0 }
+func (tw *taskWrapper) GetMaxRetries() int { return 0 }
+func (tw *taskWrapper) GetRetries() int { return 0 }
+func (tw *taskWrapper) GetCreatedAt() time.Time { return time.Time{} }
+func (tw *taskWrapper) GetTaskGroup() ITaskGroup { return nil }
+func (tw *taskWrapper) GetProvider() IProvider { return nil }
+func (tw *taskWrapper) UpdateRetries(int) error { return nil }
+func (tw *taskWrapper) GetTimeout() time.Duration { return 0 }
+func (tw *taskWrapper) UpdateLastError(string) error { return nil }
+func (tw *taskWrapper) GetCallbackName() string { return "" }
+func (tw *taskWrapper) OnComplete() {}
+func (tw *taskWrapper) OnStart() {}
 
 func (tm *TaskManagerSimple) Start() {
 	if tm.IsRunning() {
@@ -395,8 +524,14 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 		}
 	}
 
+	// Register this task as running
+	runningTask := tm.registerRunningTask(taskID, task, providerName, server)
+	
 	defer tm.wg.Done()
 	defer func() {
+		// Unregister running task
+		tm.unregisterRunningTask(taskID)
+		
 		// 4) Always release concurrency when done
 		if hasLimit {
 			<-semaphore
@@ -442,6 +577,24 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 		// Clean up concurrency retry tracking on provider validation failure
 		tm.cleanupConcurrencyRetries(taskID)
 		return
+	}
+
+	// Check if task was cancelled before execution
+	select {
+	case <-runningTask.cancelCh:
+		// Task was cancelled via DelTask
+		tm.logger.Debug().Str("taskID", taskID).Msg("[tms|processTask] Task cancelled before execution")
+		now := time.Now()
+		task.MarkAsFailed(now.Sub(started).Milliseconds(), fmt.Errorf("task cancelled"))
+		if !onCompleteCalled {
+			task.OnComplete()
+			onCompleteCalled = true
+		}
+		tm.delTaskInQueue(task)
+		tm.cleanupConcurrencyRetries(taskID)
+		return
+	default:
+		// Continue with execution
 	}
 
 	// 2) Now that concurrency is acquired, we start the actual timed work:
@@ -755,4 +908,22 @@ func AddTask(task ITask, logger *zerolog.Logger) {
 	if !tm.AddTask(task) {
 		logger.Debug().Str("taskID", task.GetID()).Msg("[tms|add-task] Task not added (duplicate)")
 	}
+}
+
+// DelTask is the global helper for deleting/cancelling tasks
+func DelTask(taskID string, interruptFn func(server string), logger *zerolog.Logger) string {
+	// Fast path: check if manager exists without lock
+	tm := (*TaskManagerSimple)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&TaskQueueManagerInstance))))
+	if tm == nil {
+		return "error: task manager not initialized"
+	}
+	
+	if tm.HasShutdownRequest() {
+		return "error: task manager shutting down"
+	}
+	
+	result := tm.DelTask(taskID, interruptFn)
+	logger.Debug().Str("taskID", taskID).Str("result", result).Msg("[tms|del-task] Task deletion attempted")
+	
+	return result
 }
