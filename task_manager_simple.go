@@ -686,8 +686,8 @@ func (tm *TaskManagerSimple) getServerSemaphore(server string) (chan struct{}, b
 		server = u.String()
 	}
 
-	tm.serverConcurrencyMu.RLock()
-	defer tm.serverConcurrencyMu.RUnlock()
+	tm.serverConcurrencyMu.Lock()
+	defer tm.serverConcurrencyMu.Unlock()
 
 	// If the server URL or name starts with a known prefix, return that semaphore
 	for prefix, sem := range tm.serverConcurrencyMap {
@@ -695,7 +695,17 @@ func (tm *TaskManagerSimple) getServerSemaphore(server string) (chan struct{}, b
 			return sem, true
 		}
 	}
-	return nil, false
+	
+	// No explicit limit found - create and store default limit of 1
+	// This ensures servers without explicit limits can only handle 1 concurrent task
+	defaultSemaphore := make(chan struct{}, 1)
+	tm.serverConcurrencyMap[server] = defaultSemaphore
+	
+	tm.logger.Debug().
+		Str("server", server).
+		Msg("[tms] Created default concurrency limit of 1 for server")
+	
+	return defaultSemaphore, true
 }
 
 // calculateConcurrencyBackoff computes exponential backoff for concurrency retries
