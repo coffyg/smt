@@ -99,6 +99,23 @@ func NewTaskManagerSimple(
 		// Fill the channel with all servers
 		for _, srv := range serverList {
 			pd.availableServers <- srv
+			
+			// Parse server URL to normalize it (remove query params)
+			normalizedSrv := srv
+			if u, err := url.Parse(srv); err == nil {
+				u.RawQuery = ""
+				u.Fragment = ""
+				normalizedSrv = u.String()
+			}
+			
+			// Set default concurrency limit of 1 for each server
+			// unless it already has a limit set
+			if _, exists := tm.serverConcurrencyMap[normalizedSrv]; !exists {
+				tm.serverConcurrencyMap[normalizedSrv] = make(chan struct{}, 1)
+				logger.Debug().
+					Str("server", normalizedSrv).
+					Msg("[tms] Set default concurrency limit of 1 for server")
+			}
 		}
 
 		// IMPORTANT: tie the condition to the same mutex used for the queue
@@ -434,6 +451,11 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 		taskWithPriority = nil
 		hasWork = false
 
+		// Check for shutdown before waiting
+		if tm.HasShutdownRequest() {
+			return
+		}
+
 		// Fast path: check atomic counters first
 		if atomic.LoadInt32(&pd.taskCount) == 0 && atomic.LoadInt32(&pd.commandCount) == 0 {
 			pd.taskQueueLock.Lock()
@@ -464,7 +486,7 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 			continue
 		}
 
-		// Grab a server
+		// Grab a server (with proper shutdown handling)
 		select {
 		case <-shutdownCh:
 			if !isCommand && taskWithPriority != nil {
@@ -677,6 +699,7 @@ func (tm *TaskManagerSimple) returnServerToPool(providerExists bool, pd *Provide
 }
 
 // getServerSemaphore checks if the server has a concurrency limit.
+// Always returns true now since we default to limit of 1.
 func (tm *TaskManagerSimple) getServerSemaphore(server string) (chan struct{}, bool) {
 	// Optional: parse out query, to unify concurrency for any query string
 	if u, err := url.Parse(server); err == nil {
@@ -687,15 +710,42 @@ func (tm *TaskManagerSimple) getServerSemaphore(server string) (chan struct{}, b
 	}
 
 	tm.serverConcurrencyMu.RLock()
-	defer tm.serverConcurrencyMu.RUnlock()
-
-	// If the server URL or name starts with a known prefix, return that semaphore
+	
+	// Check if we have an exact match or prefix match
+	if sem, exists := tm.serverConcurrencyMap[server]; exists {
+		tm.serverConcurrencyMu.RUnlock()
+		return sem, true
+	}
+	
+	// Check for prefix matches
 	for prefix, sem := range tm.serverConcurrencyMap {
 		if strings.HasPrefix(server, prefix) {
+			tm.serverConcurrencyMu.RUnlock()
 			return sem, true
 		}
 	}
-	return nil, false
+	
+	// No match found - need to create default
+	tm.serverConcurrencyMu.RUnlock()
+	
+	// Upgrade to write lock to create default
+	tm.serverConcurrencyMu.Lock()
+	defer tm.serverConcurrencyMu.Unlock()
+	
+	// Double-check in case another goroutine created it
+	if sem, exists := tm.serverConcurrencyMap[server]; exists {
+		return sem, true
+	}
+	
+	// Create default limit of 1
+	defaultSemaphore := make(chan struct{}, 1)
+	tm.serverConcurrencyMap[server] = defaultSemaphore
+	
+	tm.logger.Debug().
+		Str("server", server).
+		Msg("[tms] Created default concurrency limit of 1 for unknown server")
+	
+	return defaultSemaphore, true
 }
 
 // calculateConcurrencyBackoff computes exponential backoff for concurrency retries
@@ -750,14 +800,12 @@ func (tm *TaskManagerSimple) Shutdown() {
 	atomic.StoreInt32(&tm.shutdownRequest, 1)
 	close(tm.shutdownCh)
 
-	// Wake dispatchers one by one to avoid thundering herd
+	// Wake all dispatchers to ensure they check shutdown
 	for _, pd := range tm.providers {
 		pd.taskQueueLock.Lock()
-		// Signal instead of Broadcast to wake one at a time
-		pd.taskQueueCond.Signal()
+		// Use Broadcast to ensure all waiting goroutines wake up
+		pd.taskQueueCond.Broadcast()
 		pd.taskQueueLock.Unlock()
-		// Small delay to stagger wakeups
-		time.Sleep(1 * time.Millisecond)
 	}
 
 	tm.wg.Wait()

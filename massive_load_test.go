@@ -1015,6 +1015,12 @@ func TestMultiLayerServerHierarchy(t *testing.T) {
 	// Initialize the task manager
 	InitTaskQueueManager(&logger, &providers, nil, servers, getTimeout)
 	defer TaskQueueManagerInstance.Shutdown()
+	
+	// Set higher concurrency for test servers to avoid backoff delays
+	// With 300 tasks and 10 servers, we need ~30 concurrent per server
+	for _, serverURL := range serversList {
+		TaskQueueManagerInstance.SetTaskManagerServerMaxParallel(serverURL, 30)
+	}
 
 	// Create tasks for each provider
 	tasksPerProvider := 100
