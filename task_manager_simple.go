@@ -1658,6 +1658,9 @@ const (
 )
 
 func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string) {
+	// CRITICAL: defer wg.Done() FIRST before any early returns
+	defer tm.wg.Done()
+
 	started := time.Now()
 	var onCompleteCalled bool
 
@@ -1756,13 +1759,6 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 	// Register this task as running
 	runningTask := tm.registerRunningTask(taskID, task, providerName, server)
 
-	defer func() {
-		tm.logger.Debug().
-			Str("instance", tm.instanceName).
-			Str("taskID", taskID).
-			Msg("[tms] >>> processTask calling wg.Done()")
-		tm.wg.Done()
-	}()
 	defer func() {
 		tm.logger.Debug().
 			Str("instance", tm.instanceName).
