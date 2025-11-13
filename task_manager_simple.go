@@ -19,6 +19,40 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// DelTaskResult represents the result of a DelTask operation
+type DelTaskResult int
+
+const (
+	// DelTaskNotFound indicates the task was not found in queue or running
+	DelTaskNotFound DelTaskResult = iota
+	// DelTaskRemovedFromQueue indicates the task was successfully removed from queue
+	DelTaskRemovedFromQueue
+	// DelTaskInterruptedRunning indicates the task was interrupted while running
+	DelTaskInterruptedRunning
+	// DelTaskErrorNotRunning indicates the task manager is not running
+	DelTaskErrorNotRunning
+	// DelTaskErrorShuttingDown indicates the task manager is shutting down
+	DelTaskErrorShuttingDown
+)
+
+// String returns a human-readable description of the DelTaskResult
+func (r DelTaskResult) String() string {
+	switch r {
+	case DelTaskNotFound:
+		return "task not found"
+	case DelTaskRemovedFromQueue:
+		return "removed from queue"
+	case DelTaskInterruptedRunning:
+		return "interrupted while running"
+	case DelTaskErrorNotRunning:
+		return "task manager not running"
+	case DelTaskErrorShuttingDown:
+		return "task manager shutting down"
+	default:
+		return "unknown result"
+	}
+}
+
 // RunningTaskInfo holds information about a currently executing task
 type RunningTaskInfo struct {
 	task        ITask
@@ -44,6 +78,7 @@ type TaskManagerSimple struct {
 	serverConcurrencyMap map[string]chan struct{} // Map of servers to semaphores
 	serverConcurrencyMu  sync.RWMutex
 	concurrencyRetryMap  sync.Map                 // Track concurrency retry attempts per task ID
+	taskToProvider       sync.Map                 // Map taskID (string) -> providerName (string) for O(1) lookup
 }
 
 type ProviderData struct {
@@ -201,8 +236,8 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 		tm.logger.Error().Err(err).Msg("[tms|nil_provider|error]")
 		task.MarkAsFailed(0, err)
 		task.OnComplete()
-		// Clean up concurrency retry tracking on early failure
-		tm.cleanupConcurrencyRetries(taskID)
+		// Clean up all task tracking on early failure (though provider mapping not yet stored)
+		tm.cleanupTaskTracking(taskID)
 		return false
 	}
 
@@ -216,8 +251,8 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 			Msg("[tms] provider not found")
 		task.MarkAsFailed(0, err)
 		task.OnComplete()
-		// Clean up concurrency retry tracking on early failure
-		tm.cleanupConcurrencyRetries(taskID)
+		// Clean up all task tracking on early failure (though provider mapping not yet stored)
+		tm.cleanupTaskTracking(taskID)
 		return false
 	}
 
@@ -225,6 +260,9 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 	if !tm.addTaskToQueue(taskID) {
 		return false
 	}
+
+	// Store taskID -> providerName mapping for O(1) lookup in DelTask
+	tm.taskToProvider.Store(taskID, providerName)
 
 	// Push into the priority queue
 	priority := task.GetPriority()
@@ -243,10 +281,9 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 }
 
 // DelTask removes a task from queue or cancels it if running
-// Returns: "removed_from_queue", "interrupted_running", "not_found", or "error"
-func (tm *TaskManagerSimple) DelTask(taskID string, interruptFn func(task ITask, server string) error) string {
+func (tm *TaskManagerSimple) DelTask(taskID string, interruptFn func(task ITask, server string) error) DelTaskResult {
 	if atomic.LoadInt32(&tm.isRunning) != 1 {
-		return "error: task manager not running"
+		return DelTaskErrorNotRunning
 	}
 
 	// First, check if task is currently running
@@ -258,7 +295,7 @@ func (tm *TaskManagerSimple) DelTask(taskID string, interruptFn func(task ITask,
 		task := runningTask.task
 		server := runningTask.server
 		tm.runningTasksMu.Unlock()
-		
+
 		// Call the interrupt function if provided, passing both task and server
 		if interruptFn != nil {
 			err := interruptFn(task, server)
@@ -266,58 +303,67 @@ func (tm *TaskManagerSimple) DelTask(taskID string, interruptFn func(task ITask,
 				tm.logger.Debug().Err(err).Str("taskID", taskID).Str("server", server).Msg("[tms|DelTask] Interrupt function returned error")
 			}
 		}
-		
+
 		tm.logger.Debug().Str("taskID", taskID).Str("server", server).Msg("[tms|DelTask] Interrupted running task")
-		return "interrupted_running"
+		return DelTaskInterruptedRunning
 	}
 	tm.runningTasksMu.Unlock()
 
 	// Task is not running, check if it's in queue
 	if !tm.isTaskInQueue(taskID) {
-		return "not_found"
+		return DelTaskNotFound
 	}
 
-	// Task is queued - find and remove it from the priority queue
+	// Task is queued - use O(1) lookup to find which provider owns it
+	providerNameInterface, ok := tm.taskToProvider.Load(taskID)
+	if !ok {
+		// Task was in queue map but not in provider map - shouldn't happen
+		tm.logger.Warn().Str("taskID", taskID).Msg("[tms|DelTask] Task in queue but provider mapping not found")
+		return DelTaskNotFound
+	}
+
+	providerName := providerNameInterface.(string)
+	pd, providerExists := tm.providers[providerName]
+	if !providerExists {
+		tm.logger.Warn().Str("taskID", taskID).Str("provider", providerName).Msg("[tms|DelTask] Provider not found for task")
+		return DelTaskNotFound
+	}
+
+	// Search only this provider's queue
 	var removedTask ITask
 	removed := false
-	
-	// We need to check all providers since we don't know which one has this task
-	for providerName, pd := range tm.providers {
-		pd.taskQueueLock.Lock()
-		
-		// Search through the priority queue
-		for i := 0; i < pd.taskQueue.Len(); i++ {
-			if pd.taskQueue[i].task.GetID() == taskID {
-				// Found it - remove from heap
-				removedItem := heap.Remove(&pd.taskQueue, i).(*TaskWithPriority)
-				atomic.AddInt32(&pd.taskCount, -1)
-				
-				// Capture the task before clearing it
-				removedTask = removedItem.task
-				
-				// Return TaskWithPriority to pool
-				removedItem.task = nil
-				taskWithPriorityPool.Put(removedItem)
-				
-				removed = true
-				tm.logger.Debug().
-					Str("taskID", taskID).
-					Str("provider", providerName).
-					Msg("[tms|DelTask] Removed task from queue")
-				break
-			}
-		}
-		
-		pd.taskQueueLock.Unlock()
-		if removed {
+
+	pd.taskQueueLock.Lock()
+	for i := 0; i < pd.taskQueue.Len(); i++ {
+		if pd.taskQueue[i].task.GetID() == taskID {
+			// Found it - remove from heap
+			removedItem := heap.Remove(&pd.taskQueue, i).(*TaskWithPriority)
+			atomic.AddInt32(&pd.taskCount, -1)
+
+			// Capture the task before clearing it
+			removedTask = removedItem.task
+
+			// Return TaskWithPriority to pool
+			removedItem.task = nil
+			taskWithPriorityPool.Put(removedItem)
+
+			removed = true
+			tm.logger.Debug().
+				Str("taskID", taskID).
+				Str("provider", providerName).
+				Msg("[tms|DelTask] Removed task from queue")
 			break
 		}
 	}
+	pd.taskQueueLock.Unlock()
 
 	if removed {
 		// Remove from taskInQueue tracking
 		tm.delTaskInQueue(removedTask)
-		
+
+		// Clean up provider mapping
+		tm.taskToProvider.Delete(taskID)
+
 		// Call interrupt function even for queued tasks (server is empty since not assigned yet)
 		if interruptFn != nil {
 			err := interruptFn(removedTask, "")
@@ -325,11 +371,11 @@ func (tm *TaskManagerSimple) DelTask(taskID string, interruptFn func(task ITask,
 				tm.logger.Debug().Err(err).Str("taskID", taskID).Msg("[tms|DelTask] Interrupt function returned error for queued task")
 			}
 		}
-		
-		return "removed_from_queue"
+
+		return DelTaskRemovedFromQueue
 	}
 
-	return "not_found"
+	return DelTaskNotFound
 }
 
 // Helper methods for running task tracking
@@ -596,8 +642,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 				onCompleteCalled = true
 			}
 			tm.delTaskInQueue(task)
-			// Clean up concurrency retry tracking on panic
-			tm.cleanupConcurrencyRetries(taskID)
+			// Clean up all task tracking on panic
+			tm.cleanupTaskTracking(taskID)
 		}
 	}()
 
@@ -613,8 +659,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			onCompleteCalled = true
 		}
 		tm.delTaskInQueue(task)
-		// Clean up concurrency retry tracking on provider validation failure
-		tm.cleanupConcurrencyRetries(taskID)
+		// Clean up all task tracking on provider validation failure
+		tm.cleanupTaskTracking(taskID)
 		return
 	}
 
@@ -630,7 +676,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			onCompleteCalled = true
 		}
 		tm.delTaskInQueue(task)
-		tm.cleanupConcurrencyRetries(taskID)
+		tm.cleanupTaskTracking(taskID)
 		return
 	default:
 		// Continue with execution
@@ -651,10 +697,10 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 				onCompleteCalled = true
 			}
 			tm.delTaskInQueue(task)
-			// Clean up concurrency retry tracking on final failure
-			tm.cleanupConcurrencyRetries(taskID)
+			// Clean up all task tracking on final failure
+			tm.cleanupTaskTracking(taskID)
 		} else {
-			// Retry scenario
+			// Retry scenario - DON'T clean up provider mapping, task will be re-added
 			if level := tm.logger.GetLevel(); level <= zerolog.DebugLevel {
 				tm.logger.Debug().
 					Err(err).
@@ -667,7 +713,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			}
 			task.UpdateRetries(retries + 1)
 			tm.delTaskInQueue(task) // remove so it can be re-added
-			tm.AddTask(task)
+			tm.AddTask(task) // This will re-store the provider mapping
 		}
 	} else {
 		// Success
@@ -677,8 +723,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			onCompleteCalled = true
 		}
 		tm.delTaskInQueue(task)
-		// Clean up concurrency retry tracking on success
-		tm.cleanupConcurrencyRetries(taskID)
+		// Clean up all task tracking on success
+		tm.cleanupTaskTracking(taskID)
 	}
 }
 
@@ -787,6 +833,12 @@ func (tm *TaskManagerSimple) calculateConcurrencyBackoff(taskID string) time.Dur
 // cleanupConcurrencyRetries removes tracking for completed task
 func (tm *TaskManagerSimple) cleanupConcurrencyRetries(taskID string) {
 	tm.concurrencyRetryMap.Delete(taskID)
+}
+
+// cleanupTaskTracking removes all tracking for a completed/failed task
+func (tm *TaskManagerSimple) cleanupTaskTracking(taskID string) {
+	tm.concurrencyRetryMap.Delete(taskID)
+	tm.taskToProvider.Delete(taskID)
 }
 
 // Shutdown signals and waits for all provider dispatchers
@@ -976,19 +1028,19 @@ func AddTask(task ITask, logger *zerolog.Logger) {
 }
 
 // DelTask is the global helper for deleting/cancelling tasks
-func DelTask(taskID string, interruptFn func(task ITask, server string) error, logger *zerolog.Logger) string {
+func DelTask(taskID string, interruptFn func(task ITask, server string) error, logger *zerolog.Logger) DelTaskResult {
 	// Fast path: check if manager exists without lock
 	tm := (*TaskManagerSimple)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&TaskQueueManagerInstance))))
 	if tm == nil {
-		return "error: task manager not initialized"
+		return DelTaskErrorNotRunning
 	}
-	
+
 	if tm.HasShutdownRequest() {
-		return "error: task manager shutting down"
+		return DelTaskErrorShuttingDown
 	}
-	
+
 	result := tm.DelTask(taskID, interruptFn)
-	logger.Debug().Str("taskID", taskID).Str("result", result).Msg("[tms|del-task] Task deletion attempted")
-	
+	logger.Debug().Str("taskID", taskID).Str("result", result.String()).Msg("[tms|del-task] Task deletion attempted")
+
 	return result
 }

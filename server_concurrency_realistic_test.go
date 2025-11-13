@@ -177,9 +177,9 @@ func TestRealisticServerConcurrencyWithInterrupts(t *testing.T) {
 			}
 			
 			result := DelTask(taskID, interruptFn, &logger)
-			if result == "interrupted_running" || result == "removed_from_queue" {
+			if result == DelTaskInterruptedRunning || result == DelTaskRemovedFromQueue {
 				interrupted++
-				t.Logf("✅ DelTask(%s) succeeded: %s", taskID[:8], result)
+				t.Logf("✅ DelTask(%s) succeeded: %s", taskID[:8], result.String())
 			} else {
 				// Task might have already completed
 			}

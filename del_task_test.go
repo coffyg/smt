@@ -58,8 +58,8 @@ func TestDelTaskQueued(t *testing.T) {
 	result := tm.DelTask(task.GetID(), interruptFn)
 
 	// Verify result
-	if result != "removed_from_queue" {
-		t.Errorf("Expected 'removed_from_queue', got %s", result)
+	if result != DelTaskRemovedFromQueue {
+		t.Errorf("Expected DelTaskRemovedFromQueue, got %s", result)
 	}
 
 	// Verify task is no longer in queue
@@ -172,8 +172,8 @@ func TestDelTaskRunning(t *testing.T) {
 	result := tm.DelTask(task.GetID(), interruptFn)
 
 	// Verify result
-	if result != "interrupted_running" {
-		t.Errorf("Expected 'interrupted_running', got %s", result)
+	if result != DelTaskInterruptedRunning {
+		t.Errorf("Expected DelTaskInterruptedRunning, got %s", result)
 	}
 
 	// Wait for interrupt function to be called
@@ -289,8 +289,8 @@ func TestDelTaskLongRunning(t *testing.T) {
 	}
 
 	// Verify interrupt was called correctly
-	if result != "interrupted_running" {
-		t.Errorf("Expected 'interrupted_running', got %s", result)
+	if result != DelTaskInterruptedRunning {
+		t.Errorf("Expected DelTaskInterruptedRunning, got %s", result)
 	}
 
 	if interruptServer != runningServer {
@@ -332,8 +332,8 @@ func TestDelTaskNotFound(t *testing.T) {
 
 	result := tm.DelTask("non-existent-id", interruptFn)
 
-	if result != "not_found" {
-		t.Errorf("Expected 'not_found', got %s", result)
+	if result != DelTaskNotFound {
+		t.Errorf("Expected DelTaskNotFound, got %s", result)
 	}
 }
 
@@ -374,8 +374,8 @@ func TestDelTaskGlobal(t *testing.T) {
 
 	result := DelTask(task.GetID(), interruptFn, &logger)
 
-	if result != "removed_from_queue" {
-		t.Errorf("Expected 'removed_from_queue', got %s", result)
+	if result != DelTaskRemovedFromQueue {
+		t.Errorf("Expected DelTaskRemovedFromQueue, got %s", result)
 	}
 
 	// Verify interrupt function was called for queued task with empty server
