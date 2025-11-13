@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"net/url"
+	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -16,8 +17,17 @@ import (
 	"unsafe"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 )
+
+// ConfigOptions holds distributed configuration for Redis coordination
+type ConfigOptions struct {
+	RedisAddr    string // Redis server address (e.g., "localhost:6379")
+	RedisPwd     string // Redis password
+	RedisDB      int    // Redis database number
+	InstanceName string // Unique instance identifier (if empty, uses hostname-PID)
+}
 
 // DelTaskResult represents the result of a DelTask operation
 type DelTaskResult int
@@ -79,6 +89,13 @@ type TaskManagerSimple struct {
 	serverConcurrencyMu  sync.RWMutex
 	concurrencyRetryMap  sync.Map                 // Track concurrency retry attempts per task ID
 	taskToProvider       sync.Map                 // Map taskID (string) -> providerName (string) for O(1) lookup
+
+	// Distributed coordination fields
+	redisClient          *redis.Client
+	instanceName         string
+	isMaster             bool
+	heartbeatStop        chan struct{}
+	lockRenewalStop      chan struct{}
 }
 
 type ProviderData struct {
@@ -93,6 +110,318 @@ type ProviderData struct {
 	commandQueue   *CommandQueue
 	commandSet     map[uuid.UUID]struct{}
 	commandSetLock sync.Mutex
+}
+
+// generateInstanceName creates a unique instance identifier
+func generateInstanceName() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+	pid := os.Getpid()
+	return fmt.Sprintf("%s-%d", hostname, pid)
+}
+
+// initRedisClient initializes Redis connection if config provided
+func (tm *TaskManagerSimple) initRedisClient(cfg *ConfigOptions) error {
+	if cfg == nil || cfg.RedisAddr == "" {
+		// No Redis config - local-only mode
+		tm.logger.Info().Msg("[tms|distributed] Running in local-only mode (no Redis)")
+		return nil
+	}
+
+	// Set instance name (use provided or generate from hostname-PID)
+	if cfg.InstanceName != "" {
+		tm.instanceName = cfg.InstanceName
+	} else {
+		tm.instanceName = generateInstanceName()
+	}
+
+	// Create Redis client
+	tm.redisClient = redis.NewClient(&redis.Options{
+		Addr:     cfg.RedisAddr,
+		Password: cfg.RedisPwd,
+		DB:       cfg.RedisDB,
+	})
+
+	// Test connection
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := tm.redisClient.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("failed to connect to Redis at %s: %w", cfg.RedisAddr, err)
+	}
+
+	tm.logger.Info().
+		Str("instance", tm.instanceName).
+		Str("redis", cfg.RedisAddr).
+		Msg("[tms|distributed] Connected to Redis")
+
+	return nil
+}
+
+// acquireMasterLock attempts to acquire the master lock in Redis
+func (tm *TaskManagerSimple) acquireMasterLock() error {
+	if tm.redisClient == nil {
+		return fmt.Errorf("Redis client not initialized")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Try to acquire lock with SET NX EX (atomic set if not exists with expiry)
+	lockKey := "smt:master:lock"
+	success, err := tm.redisClient.SetNX(ctx, lockKey, tm.instanceName, 10*time.Second).Result()
+	if err != nil {
+		return fmt.Errorf("failed to acquire master lock: %w", err)
+	}
+
+	if !success {
+		// Lock exists - check if it's expired
+		currentHolder, err := tm.redisClient.Get(ctx, lockKey).Result()
+		if err == redis.Nil {
+			// Lock disappeared between check and now - retry
+			return tm.acquireMasterLock()
+		} else if err != nil {
+			return fmt.Errorf("failed to check existing lock: %w", err)
+		}
+		return fmt.Errorf("another master is running: %s", currentHolder)
+	}
+
+	tm.isMaster = true
+	tm.logger.Info().
+		Str("instance", tm.instanceName).
+		Msg("[tms|distributed] Acquired master lock")
+
+	return nil
+}
+
+// renewMasterLock runs as goroutine to periodically renew the master lock
+func (tm *TaskManagerSimple) renewMasterLock() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-tm.lockRenewalStop:
+			return
+		case <-ticker.C:
+			if tm.redisClient == nil {
+				continue
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			err := tm.redisClient.Expire(ctx, "smt:master:lock", 10*time.Second).Err()
+			cancel()
+
+			if err != nil {
+				tm.logger.Error().
+					Err(err).
+					Str("instance", tm.instanceName).
+					Msg("[tms|distributed] Failed to renew master lock")
+			} else {
+				tm.logger.Debug().
+					Str("instance", tm.instanceName).
+					Msg("[tms|distributed] Renewed master lock")
+			}
+		}
+	}
+}
+
+// releaseMasterLock releases the master lock on shutdown
+func (tm *TaskManagerSimple) releaseMasterLock() {
+	if tm.redisClient == nil || !tm.isMaster {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Only delete if we still hold it
+	script := `
+		if redis.call("GET", KEYS[1]) == ARGV[1] then
+			return redis.call("DEL", KEYS[1])
+		else
+			return 0
+		end
+	`
+	_, err := tm.redisClient.Eval(ctx, script, []string{"smt:master:lock"}, tm.instanceName).Result()
+	if err != nil {
+		tm.logger.Error().
+			Err(err).
+			Str("instance", tm.instanceName).
+			Msg("[tms|distributed] Failed to release master lock")
+	} else {
+		tm.logger.Info().
+			Str("instance", tm.instanceName).
+			Msg("[tms|distributed] Released master lock")
+	}
+}
+
+// startHeartbeat runs as goroutine to periodically update instance heartbeat
+func (tm *TaskManagerSimple) startHeartbeat() {
+	if tm.redisClient == nil {
+		return
+	}
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	// Send initial heartbeat immediately
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	heartbeatKey := fmt.Sprintf("smt:instances:%s:heartbeat", tm.instanceName)
+	err := tm.redisClient.Set(ctx, heartbeatKey, time.Now().Unix(), 30*time.Second).Err()
+	cancel()
+
+	if err != nil {
+		tm.logger.Error().
+			Err(err).
+			Str("instance", tm.instanceName).
+			Msg("[tms|distributed] Failed to send initial heartbeat")
+	} else {
+		tm.logger.Debug().
+			Str("instance", tm.instanceName).
+			Msg("[tms|distributed] Sent initial heartbeat")
+	}
+
+	for {
+		select {
+		case <-tm.heartbeatStop:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			err := tm.redisClient.Set(ctx, heartbeatKey, time.Now().Unix(), 30*time.Second).Err()
+			cancel()
+
+			if err != nil {
+				tm.logger.Error().
+					Err(err).
+					Str("instance", tm.instanceName).
+					Msg("[tms|distributed] Failed to send heartbeat")
+			} else {
+				tm.logger.Debug().
+					Str("instance", tm.instanceName).
+					Msg("[tms|distributed] Heartbeat sent")
+			}
+		}
+	}
+}
+
+// stopHeartbeat stops the heartbeat goroutine and removes heartbeat key
+func (tm *TaskManagerSimple) stopHeartbeat() {
+	if tm.redisClient == nil {
+		return
+	}
+
+	// Signal heartbeat goroutine to stop
+	close(tm.heartbeatStop)
+
+	// Remove heartbeat key
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	heartbeatKey := fmt.Sprintf("smt:instances:%s:heartbeat", tm.instanceName)
+	err := tm.redisClient.Del(ctx, heartbeatKey).Err()
+	if err != nil {
+		tm.logger.Error().
+			Err(err).
+			Str("instance", tm.instanceName).
+			Msg("[tms|distributed] Failed to remove heartbeat key")
+	} else {
+		tm.logger.Info().
+			Str("instance", tm.instanceName).
+			Msg("[tms|distributed] Removed heartbeat key")
+	}
+}
+
+// monitorDeadInstances runs as goroutine to detect and cleanup crashed instances
+func (tm *TaskManagerSimple) monitorDeadInstances() {
+	if tm.redisClient == nil {
+		return
+	}
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-tm.shutdownCh:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+			// Scan for all instance heartbeat keys
+			pattern := "smt:instances:*:heartbeat"
+			var cursor uint64
+			var deadInstances []string
+
+			for {
+				keys, nextCursor, err := tm.redisClient.Scan(ctx, cursor, pattern, 100).Result()
+				if err != nil {
+					tm.logger.Error().
+						Err(err).
+						Msg("[tms|distributed] Failed to scan for instance heartbeats")
+					break
+				}
+
+				// Check TTL for each key - if expired (TTL -2), instance is dead
+				for _, key := range keys {
+					ttl, err := tm.redisClient.TTL(ctx, key).Result()
+					if err != nil {
+						continue
+					}
+
+					// TTL -2 means key doesn't exist (expired)
+					// TTL -1 means key exists but has no expiry (shouldn't happen)
+					if ttl == -2*time.Second {
+						// Extract instance name from key: smt:instances:{name}:heartbeat
+						parts := strings.Split(key, ":")
+						if len(parts) >= 3 {
+							instanceName := parts[2]
+							deadInstances = append(deadInstances, instanceName)
+						}
+					}
+				}
+
+				cursor = nextCursor
+				if cursor == 0 {
+					break
+				}
+			}
+
+			cancel()
+
+			// Cleanup dead instances
+			for _, instanceName := range deadInstances {
+				if instanceName != tm.instanceName {
+					tm.logger.Warn().
+						Str("deadInstance", instanceName).
+						Msg("[tms|distributed] Detected dead instance, cleaning up")
+					tm.cleanupDeadInstance(instanceName)
+				}
+			}
+		}
+	}
+}
+
+// cleanupDeadInstance releases all resources held by a crashed instance
+func (tm *TaskManagerSimple) cleanupDeadInstance(instanceName string) {
+	if tm.redisClient == nil {
+		return
+	}
+
+	tm.logger.Info().
+		Str("deadInstance", instanceName).
+		Msg("[tms|distributed] Starting cleanup for dead instance")
+
+	// Phase 3 will implement slot cleanup here
+	// For now, just log that we detected the crash
+	// TODO: Scan smt:slots:*:holders and remove instanceName entries
+	// TODO: Use ctx with timeout when implementing slot cleanup
+
+	tm.logger.Info().
+		Str("deadInstance", instanceName).
+		Msg("[tms|distributed] Cleanup complete for dead instance")
 }
 
 func NewTaskManagerSimple(
@@ -863,6 +1192,32 @@ func (tm *TaskManagerSimple) Shutdown() {
 	tm.wg.Wait()
 	atomic.StoreInt32(&tm.isRunning, 0)
 
+	// Distributed cleanup
+	if tm.redisClient != nil {
+		// Stop heartbeat
+		tm.stopHeartbeat()
+
+		// Release master lock if we're the master
+		if tm.isMaster {
+			close(tm.lockRenewalStop)
+			tm.releaseMasterLock()
+		}
+
+		// TODO Phase 3: Release all Redis slots held by this instance
+
+		// Close Redis client
+		if err := tm.redisClient.Close(); err != nil {
+			tm.logger.Error().
+				Err(err).
+				Str("instance", tm.instanceName).
+				Msg("[tms|distributed] Failed to close Redis client")
+		} else {
+			tm.logger.Info().
+				Str("instance", tm.instanceName).
+				Msg("[tms|distributed] Redis client closed")
+		}
+	}
+
 	if tm.logger.GetLevel() <= zerolog.DebugLevel {
 		tm.logger.Debug().Msg("[tms] Task manager shutdown [FINISHED]")
 	}
@@ -977,7 +1332,127 @@ var (
 	errPanicInHandler   = "panic occurred in handler: %v\n%s"
 )
 
-// InitTaskQueueManager creates and starts the global manager
+// InitTaskQueueManagerMaster creates and starts a master instance with Redis coordination
+func InitTaskQueueManagerMaster(
+	cfg ConfigOptions,
+	logger *zerolog.Logger,
+	providers *[]IProvider,
+	tasks []ITask,
+	servers map[string][]string,
+	getTimeout func(string, string) time.Duration,
+) error {
+	taskManagerMutex.Lock()
+	defer taskManagerMutex.Unlock()
+
+	logger.Info().Msg("[tms|distributed] Master initialization starting")
+
+	// Create task manager
+	tm := NewTaskManagerSimple(providers, servers, logger, getTimeout)
+
+	// Initialize Redis connection
+	if err := tm.initRedisClient(&cfg); err != nil {
+		return fmt.Errorf("failed to initialize Redis: %w", err)
+	}
+
+	// Initialize stop channels
+	tm.heartbeatStop = make(chan struct{})
+	tm.lockRenewalStop = make(chan struct{})
+
+	// Acquire master lock
+	if tm.redisClient != nil {
+		if err := tm.acquireMasterLock(); err != nil {
+			return fmt.Errorf("failed to acquire master lock: %w", err)
+		}
+
+		// Start lock renewal goroutine
+		go tm.renewMasterLock()
+
+		// TODO Phase 2: Publish providers/servers config to Redis
+		// TODO Phase 2: Start Pub/Sub publisher
+
+		// Start heartbeat
+		go tm.startHeartbeat()
+
+		// Start dead instance monitor
+		go tm.monitorDeadInstances()
+	}
+
+	// Start task manager
+	tm.Start()
+
+	// Store globally
+	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&TaskQueueManagerInstance)), unsafe.Pointer(tm))
+
+	logger.Info().
+		Str("instance", tm.instanceName).
+		Bool("isMaster", tm.isMaster).
+		Msg("[tms|distributed] Master started")
+	taskManagerCond.Broadcast()
+
+	// Requeue uncompleted tasks
+	RequeueTaskIfNeeded(logger, tasks)
+
+	return nil
+}
+
+// InitTaskQueueSlave creates and starts a slave instance that pulls config from Redis
+func InitTaskQueueSlave(
+	cfg ConfigOptions,
+	logger *zerolog.Logger,
+	tasks []ITask,
+	getTimeout func(string, string) time.Duration,
+) error {
+	taskManagerMutex.Lock()
+	defer taskManagerMutex.Unlock()
+
+	logger.Info().Msg("[tms|distributed] Slave initialization starting")
+
+	// TODO Phase 2: Pull providers/servers from Redis
+	// For now, create empty task manager that will fail gracefully
+	var emptyProviders []IProvider
+	emptyServers := make(map[string][]string)
+
+	tm := NewTaskManagerSimple(&emptyProviders, emptyServers, logger, getTimeout)
+
+	// Initialize Redis connection
+	if err := tm.initRedisClient(&cfg); err != nil {
+		return fmt.Errorf("failed to initialize Redis: %w", err)
+	}
+
+	// Initialize stop channels
+	tm.heartbeatStop = make(chan struct{})
+
+	if tm.redisClient != nil {
+		// TODO Phase 2: Load config from Redis with retry logic
+		// TODO Phase 2: Validate config before using
+		// TODO Phase 2: Subscribe to Pub/Sub for config updates
+
+		// Start heartbeat
+		go tm.startHeartbeat()
+
+		// Start dead instance monitor (slaves also monitor for cleanup)
+		go tm.monitorDeadInstances()
+	}
+
+	// Start task manager
+	tm.Start()
+
+	// Store globally
+	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&TaskQueueManagerInstance)), unsafe.Pointer(tm))
+
+	logger.Info().
+		Str("instance", tm.instanceName).
+		Bool("isMaster", tm.isMaster).
+		Msg("[tms|distributed] Slave started (Phase 2 TODO: config loading)")
+	taskManagerCond.Broadcast()
+
+	// Requeue uncompleted tasks
+	RequeueTaskIfNeeded(logger, tasks)
+
+	return nil
+}
+
+// InitTaskQueueManager creates and starts the global manager (local-only mode)
 func InitTaskQueueManager(
 	logger *zerolog.Logger,
 	providers *[]IProvider,
