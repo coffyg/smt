@@ -66,9 +66,9 @@ func (r DelTaskResult) String() string {
 
 // RunningTaskInfo holds information about a currently executing task
 type RunningTaskInfo struct {
-	task        ITask
-	interruptFn func(task ITask, server string) error
-	cancelCh    chan struct{}
+	task         ITask
+	interruptFn  func(task ITask, server string) error
+	cancelCh     chan struct{}
 	providerName string
 	server       string
 }
@@ -88,28 +88,29 @@ type TaskManagerSimple struct {
 	getTimeout           func(string, string) time.Duration
 	serverConcurrencyMap map[string]chan struct{} // Map of servers to semaphores
 	serverConcurrencyMu  sync.RWMutex
-	concurrencyRetryMap  sync.Map                 // Track concurrency retry attempts per task ID
-	taskToProvider       sync.Map                 // Map taskID (string) -> providerName (string) for O(1) lookup
+	concurrencyRetryMap  sync.Map // Track concurrency retry attempts per task ID
+	taskToProvider       sync.Map // Map taskID (string) -> providerName (string) for O(1) lookup
 
 	// Distributed coordination fields
-	redisClient              *redis.Client
-	instanceName             string
-	isMaster                 bool
-	heartbeatStop            chan struct{}
-	lockRenewalStop          chan struct{}
-	slotCoordinator          *RedisSlotCoordinator
-	masterControlledServers  map[string]bool // Servers controlled by Master (slaves can't modify these)
+	redisClient               *redis.Client
+	instanceName              string
+	isMaster                  bool
+	heartbeatStop             chan struct{}
+	lockRenewalStop           chan struct{}
+	slotCoordinator           *RedisSlotCoordinator
+	masterControlledServers   map[string]bool // Servers controlled by Master (slaves can't modify these)
 	masterControlledServersMu sync.RWMutex
+	configPubSub              *redis.PubSub // Track pubsub for clean shutdown
 }
 
 type ProviderData struct {
-	taskQueue           TaskQueuePrio
-	taskQueueLock       sync.Mutex
-	taskQueueCond       *sync.Cond
-	servers             []string
-	availableServers    chan string
-	taskCount           int32 // atomic counter for tasks
-	commandCount        int32 // atomic counter for commands
+	taskQueue        TaskQueuePrio
+	taskQueueLock    sync.Mutex
+	taskQueueCond    *sync.Cond
+	servers          []string
+	availableServers chan string
+	taskCount        int32 // atomic counter for tasks
+	commandCount     int32 // atomic counter for commands
 
 	commandQueue   *CommandQueue
 	commandSet     map[uuid.UUID]struct{}
@@ -194,6 +195,7 @@ func (rsc *RedisSlotCoordinator) AcquireSlot(ctx context.Context, serverURL stri
 	maxKey := fmt.Sprintf("smt:slots:%s:max", serverURL)
 	acquiredKey := fmt.Sprintf("smt:slots:%s:acquired", serverURL)
 	holdersKey := fmt.Sprintf("smt:slots:%s:holders", serverURL)
+	waitingKey := fmt.Sprintf("smt:slots:%s:waiting", serverURL)
 
 	result, err := rsc.client.Eval(ctx, luaAcquireSlot,
 		[]string{maxKey, acquiredKey, holdersKey},
@@ -213,6 +215,8 @@ func (rsc *RedisSlotCoordinator) AcquireSlot(ctx context.Context, serverURL stri
 		rsc.logger.Warn().
 			Str("server", serverURL).
 			Msg("[tms|redis-slots] No max limit found in Redis")
+		// Ensure we are not in waiting set
+		_ = rsc.client.ZRem(ctx, waitingKey, rsc.instanceName).Err()
 		return true
 	}
 
@@ -221,6 +225,9 @@ func (rsc *RedisSlotCoordinator) AcquireSlot(ctx context.Context, serverURL stri
 		count, _ := rsc.localSlots.LoadOrStore(serverURL, 0)
 		rsc.localSlots.Store(serverURL, count.(int)+1)
 
+		// Remove from waiting set since we acquired
+		_ = rsc.client.ZRem(ctx, waitingKey, rsc.instanceName).Err()
+
 		rsc.logger.Debug().
 			Str("server", serverURL).
 			Str("instance", rsc.instanceName).
@@ -228,8 +235,51 @@ func (rsc *RedisSlotCoordinator) AcquireSlot(ctx context.Context, serverURL stri
 		return true
 	}
 
-	// result == 0 means limit reached
+	// result == 0 means limit reached - add to waiting set
+	now := float64(time.Now().UnixNano()) / 1e9
+	_ = rsc.client.ZAdd(ctx, waitingKey, redis.Z{
+		Score:  now,
+		Member: rsc.instanceName,
+	}).Err()
+	_ = rsc.client.Expire(ctx, waitingKey, 5*time.Minute).Err()
 	return false
+}
+
+// CheckFairnessBeforeAcquire checks if other instances are starving and yields if needed
+func (rsc *RedisSlotCoordinator) CheckFairnessBeforeAcquire(ctx context.Context, serverURL string) {
+	waitingKey := fmt.Sprintf("smt:slots:%s:waiting", serverURL)
+
+	// Get oldest waiter (lowest score)
+	waiters, err := rsc.client.ZRangeWithScores(ctx, waitingKey, 0, 0).Result()
+	if err != nil || len(waiters) == 0 {
+		// No one waiting, proceed immediately
+		return
+	}
+
+	oldestWaiter := waiters[0]
+	oldestInstance := oldestWaiter.Member.(string)
+	oldestTimestamp := oldestWaiter.Score
+
+	// If oldest waiter is me, no need to yield
+	if oldestInstance == rsc.instanceName {
+		return
+	}
+
+	// Check how long they've been waiting
+	now := float64(time.Now().UnixNano()) / 1e9
+	waitTime := now - oldestTimestamp
+
+	// If they've been waiting > 5ms, yield briefly to let them acquire
+	if waitTime > 0.005 { // 5ms
+		sleepDuration := 10 * time.Millisecond
+		rsc.logger.Debug().
+			Str("server", serverURL).
+			Str("starvedInstance", oldestInstance).
+			Float64("waitTimeMs", waitTime*1000).
+			Dur("yieldDuration", sleepDuration).
+			Msg("[tms|redis-slots] Yielding to starved instance")
+		time.Sleep(sleepDuration)
+	}
 }
 
 // ReleaseSlot releases a slot for the given server
@@ -336,7 +386,7 @@ func (rsc *RedisSlotCoordinator) ReleaseAllSlots(ctx context.Context) {
 	})
 
 	if totalReleased > 0 {
-		rsc.logger.Info().
+		rsc.logger.Debug().
 			Str("instance", rsc.instanceName).
 			Int("slotsReleased", totalReleased).
 			Msg("[tms|redis-slots] Released all slots")
@@ -571,6 +621,7 @@ func (tm *TaskManagerSimple) subscribeConfigUpdates() {
 
 	ctx := context.Background()
 	pubsub := tm.redisClient.Subscribe(ctx, "smt:config:updates")
+	tm.configPubSub = pubsub // Store for shutdown
 	defer pubsub.Close()
 
 	tm.logger.Info().
@@ -589,19 +640,21 @@ func (tm *TaskManagerSimple) subscribeConfigUpdates() {
 
 	// Listen for messages
 	ch := pubsub.Channel()
+
 	for {
 		select {
 		case <-tm.shutdownCh:
-			tm.logger.Info().
+			tm.logger.Debug().
 				Str("instance", tm.instanceName).
 				Msg("[tms|distributed] Config subscription shutting down")
 			return
-		case msg := <-ch:
-			if msg == nil {
-				continue
+		case msg, ok := <-ch:
+			if !ok || msg == nil {
+				// Channel closed
+				return
 			}
 
-			tm.logger.Info().
+			tm.logger.Debug().
 				Str("instance", tm.instanceName).
 				Str("message", msg.Payload).
 				Msg("[tms|distributed] Received config update notification")
@@ -644,7 +697,7 @@ func (tm *TaskManagerSimple) subscribeConfigUpdates() {
 						tm.serverConcurrencyMap[serverURL] = make(chan struct{}, newLimit)
 						updatedCount++
 
-						tm.logger.Info().
+						tm.logger.Debug().
 							Str("server", serverURL).
 							Int("oldLimit", oldLimit).
 							Int("newLimit", newLimit).
@@ -655,7 +708,7 @@ func (tm *TaskManagerSimple) subscribeConfigUpdates() {
 				tm.serverConcurrencyMu.Unlock()
 
 				if updatedCount > 0 {
-					tm.logger.Info().
+					tm.logger.Debug().
 						Str("instance", tm.instanceName).
 						Int("updated", updatedCount).
 						Msg("[tms|distributed] Applied server limit hot-reload")
@@ -824,8 +877,7 @@ func (tm *TaskManagerSimple) stopHeartbeat() {
 		return
 	}
 
-	// Signal heartbeat goroutine to stop
-	close(tm.heartbeatStop)
+	// heartbeatStop already closed in Shutdown()
 
 	// Remove heartbeat key
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1092,7 +1144,7 @@ func NewTaskManagerSimple(
 		// Fill the channel with all servers
 		for _, srv := range serverList {
 			pd.availableServers <- srv
-			
+
 			// Parse server URL to normalize it (remove query params)
 			normalizedSrv := srv
 			if u, err := url.Parse(srv); err == nil {
@@ -1100,7 +1152,7 @@ func NewTaskManagerSimple(
 				u.Fragment = ""
 				normalizedSrv = u.String()
 			}
-			
+
 			// Set default concurrency limit of 1 for each server
 			// unless it already has a limit set
 			if _, exists := tm.serverConcurrencyMap[normalizedSrv]; !exists {
@@ -1119,7 +1171,6 @@ func NewTaskManagerSimple(
 
 	return tm
 }
-
 
 func (tm *TaskManagerSimple) SetTaskManagerServerMaxParallel(prefix string, maxParallel int) {
 	// Check if this is a slave trying to modify Master-controlled server
@@ -1222,6 +1273,9 @@ func (tm *TaskManagerSimple) AddTasks(tasks []ITask) (count int, err error) {
 
 // AddTask enqueues a task if not already known. Returns true if successfully enqueued.
 func (tm *TaskManagerSimple) AddTask(task ITask) bool {
+	if atomic.LoadInt32(&tm.shutdownRequest) == 1 {
+		return false
+	}
 	if atomic.LoadInt32(&tm.isRunning) != 1 {
 		// Manager not running; cannot queue
 		return false
@@ -1380,7 +1434,7 @@ func (tm *TaskManagerSimple) DelTask(taskID string, interruptFn func(task ITask,
 func (tm *TaskManagerSimple) registerRunningTask(taskID string, task ITask, providerName, server string) *RunningTaskInfo {
 	tm.runningTasksMu.Lock()
 	defer tm.runningTasksMu.Unlock()
-	
+
 	info := &RunningTaskInfo{
 		task:         task,
 		cancelCh:     make(chan struct{}),
@@ -1388,14 +1442,14 @@ func (tm *TaskManagerSimple) registerRunningTask(taskID string, task ITask, prov
 		server:       server,
 	}
 	tm.runningTasks[taskID] = info
-	
+
 	return info
 }
 
 func (tm *TaskManagerSimple) unregisterRunningTask(taskID string) {
 	tm.runningTasksMu.Lock()
 	defer tm.runningTasksMu.Unlock()
-	
+
 	delete(tm.runningTasks, taskID)
 }
 
@@ -1404,21 +1458,21 @@ type taskWrapper struct {
 	id string
 }
 
-func (tw *taskWrapper) GetID() string { return tw.id }
-func (tw *taskWrapper) MarkAsSuccess(t int64) {}
+func (tw *taskWrapper) GetID() string                   { return tw.id }
+func (tw *taskWrapper) MarkAsSuccess(t int64)           {}
 func (tw *taskWrapper) MarkAsFailed(t int64, err error) {}
-func (tw *taskWrapper) GetPriority() int { return 0 }
-func (tw *taskWrapper) GetMaxRetries() int { return 0 }
-func (tw *taskWrapper) GetRetries() int { return 0 }
-func (tw *taskWrapper) GetCreatedAt() time.Time { return time.Time{} }
-func (tw *taskWrapper) GetTaskGroup() ITaskGroup { return nil }
-func (tw *taskWrapper) GetProvider() IProvider { return nil }
-func (tw *taskWrapper) UpdateRetries(int) error { return nil }
-func (tw *taskWrapper) GetTimeout() time.Duration { return 0 }
-func (tw *taskWrapper) UpdateLastError(string) error { return nil }
-func (tw *taskWrapper) GetCallbackName() string { return "" }
-func (tw *taskWrapper) OnComplete() {}
-func (tw *taskWrapper) OnStart() {}
+func (tw *taskWrapper) GetPriority() int                { return 0 }
+func (tw *taskWrapper) GetMaxRetries() int              { return 0 }
+func (tw *taskWrapper) GetRetries() int                 { return 0 }
+func (tw *taskWrapper) GetCreatedAt() time.Time         { return time.Time{} }
+func (tw *taskWrapper) GetTaskGroup() ITaskGroup        { return nil }
+func (tw *taskWrapper) GetProvider() IProvider          { return nil }
+func (tw *taskWrapper) UpdateRetries(int) error         { return nil }
+func (tw *taskWrapper) GetTimeout() time.Duration       { return 0 }
+func (tw *taskWrapper) UpdateLastError(string) error    { return nil }
+func (tw *taskWrapper) GetCallbackName() string         { return "" }
+func (tw *taskWrapper) OnComplete()                     {}
+func (tw *taskWrapper) OnStart()                        {}
 
 func (tm *TaskManagerSimple) Start() {
 	if tm.IsRunning() {
@@ -1432,11 +1486,20 @@ func (tm *TaskManagerSimple) Start() {
 	}
 }
 
-
 func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
-	defer tm.wg.Done()
+	defer func() {
+		tm.logger.Debug().
+			Str("instance", tm.instanceName).
+			Str("provider", providerName).
+			Msg("[tms] providerDispatcher exiting, calling wg.Done()")
+		tm.wg.Done()
+	}()
 	pd := tm.providers[providerName]
 	shutdownCh := tm.shutdownCh
+	tm.logger.Debug().
+		Str("instance", tm.instanceName).
+		Str("provider", providerName).
+		Msg("[tms] providerDispatcher started")
 
 	const batchSize = 4
 	serverBatch := make([]string, 0, batchSize)
@@ -1497,18 +1560,34 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 
 		// Check for shutdown before waiting
 		if tm.HasShutdownRequest() {
+			tm.logger.Debug().
+				Str("instance", tm.instanceName).
+				Str("provider", providerName).
+				Msg("[tms] providerDispatcher: shutdown detected before wait")
 			return
 		}
 
 		// Fast path: check atomic counters first
 		if atomic.LoadInt32(&pd.taskCount) == 0 && atomic.LoadInt32(&pd.commandCount) == 0 {
+			tm.logger.Debug().
+				Str("instance", tm.instanceName).
+				Str("provider", providerName).
+				Msg("[tms] providerDispatcher: entering Wait()")
 			pd.taskQueueLock.Lock()
 			// Double-check under lock
 			for pd.taskQueue.Len() == 0 && pd.commandQueue.Len() == 0 && !tm.HasShutdownRequest() {
 				pd.taskQueueCond.Wait()
 			}
 			pd.taskQueueLock.Unlock()
+			tm.logger.Debug().
+				Str("instance", tm.instanceName).
+				Str("provider", providerName).
+				Msg("[tms] providerDispatcher: woke from Wait()")
 			if tm.HasShutdownRequest() {
+				tm.logger.Debug().
+					Str("instance", tm.instanceName).
+					Str("provider", providerName).
+					Msg("[tms] providerDispatcher: shutdown detected after wait")
 				return
 			}
 		}
@@ -1531,8 +1610,16 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 		}
 
 		// Grab a server (with proper shutdown handling)
+		tm.logger.Debug().
+			Str("instance", tm.instanceName).
+			Str("provider", providerName).
+			Msg("[tms] providerDispatcher: waiting for availableServers")
 		select {
 		case <-shutdownCh:
+			tm.logger.Debug().
+				Str("instance", tm.instanceName).
+				Str("provider", providerName).
+				Msg("[tms] providerDispatcher: shutdown in select")
 			if !isCommand && taskWithPriority != nil {
 				// Return TWP to pool
 				taskWithPriority.task = nil
@@ -1541,6 +1628,10 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 			return
 
 		case server = <-pd.availableServers:
+			tm.logger.Debug().
+				Str("instance", tm.instanceName).
+				Str("provider", providerName).
+				Msg("[tms] providerDispatcher: got server from channel")
 			tm.wg.Add(1)
 			if isCommand {
 				go tm.processCommand(command, providerName, server)
@@ -1574,6 +1665,11 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 	provider := task.GetProvider()
 	pd, providerExists := tm.providers[providerName]
 
+	tm.logger.Debug().
+		Str("instance", tm.instanceName).
+		Str("taskID", taskID).
+		Msg("[tms] >>> processTask STARTED")
+
 	// 1) Acquire concurrency FIRST (non-blocking with retry).
 	// Use distributed coordination if available, otherwise fallback to local semaphores
 	var semaphore chan struct{}
@@ -1593,6 +1689,9 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 		usingRedis = true
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
+
+		// Fairness check: yield if others have been starving
+		tm.slotCoordinator.CheckFairnessBeforeAcquire(ctx, normalizedServer)
 
 		acquired := tm.slotCoordinator.AcquireSlot(ctx, normalizedServer)
 		if !acquired {
@@ -1656,9 +1755,19 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 
 	// Register this task as running
 	runningTask := tm.registerRunningTask(taskID, task, providerName, server)
-	
-	defer tm.wg.Done()
+
 	defer func() {
+		tm.logger.Debug().
+			Str("instance", tm.instanceName).
+			Str("taskID", taskID).
+			Msg("[tms] >>> processTask calling wg.Done()")
+		tm.wg.Done()
+	}()
+	defer func() {
+		tm.logger.Debug().
+			Str("instance", tm.instanceName).
+			Str("taskID", taskID).
+			Msg("[tms] >>> processTask cleanup starting")
 		// Unregister running task
 		tm.unregisterRunningTask(taskID)
 
@@ -1768,7 +1877,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			}
 			task.UpdateRetries(retries + 1)
 			tm.delTaskInQueue(task) // remove so it can be re-added
-			tm.AddTask(task) // This will re-store the provider mapping
+			tm.AddTask(task)        // This will re-store the provider mapping
 		}
 	} else {
 		// Success
@@ -1811,13 +1920,13 @@ func (tm *TaskManagerSimple) getServerSemaphore(server string) (chan struct{}, b
 	}
 
 	tm.serverConcurrencyMu.RLock()
-	
+
 	// Check if we have an exact match or prefix match
 	if sem, exists := tm.serverConcurrencyMap[server]; exists {
 		tm.serverConcurrencyMu.RUnlock()
 		return sem, true
 	}
-	
+
 	// Check for prefix matches
 	for prefix, sem := range tm.serverConcurrencyMap {
 		if strings.HasPrefix(server, prefix) {
@@ -1825,27 +1934,27 @@ func (tm *TaskManagerSimple) getServerSemaphore(server string) (chan struct{}, b
 			return sem, true
 		}
 	}
-	
+
 	// No match found - need to create default
 	tm.serverConcurrencyMu.RUnlock()
-	
+
 	// Upgrade to write lock to create default
 	tm.serverConcurrencyMu.Lock()
 	defer tm.serverConcurrencyMu.Unlock()
-	
+
 	// Double-check in case another goroutine created it
 	if sem, exists := tm.serverConcurrencyMap[server]; exists {
 		return sem, true
 	}
-	
+
 	// Create default limit of 1
 	defaultSemaphore := make(chan struct{}, 1)
 	tm.serverConcurrencyMap[server] = defaultSemaphore
-	
+
 	tm.logger.Debug().
 		Str("server", server).
 		Msg("[tms] Created default concurrency limit of 1 for unknown server")
-	
+
 	return defaultSemaphore, true
 }
 
@@ -1857,31 +1966,31 @@ func (tm *TaskManagerSimple) calculateConcurrencyBackoff(taskID string) time.Dur
 	if retriesInterface != nil {
 		retries = retriesInterface.(int)
 	}
-	
+
 	// Increment retry count
 	tm.concurrencyRetryMap.Store(taskID, retries+1)
-	
+
 	// Exponential backoff: 5ms * 2^retries, capped at 800ms
 	baseDelay := 5 * time.Millisecond
 	maxDelay := 800 * time.Millisecond
-	
+
 	exponentialDelay := time.Duration(float64(baseDelay) * math.Pow(2, float64(retries)))
 	if exponentialDelay > maxDelay {
 		exponentialDelay = maxDelay
 	}
-	
+
 	// Add 0-50% jitter to prevent thundering herd
 	jitterPercent := rand.Float64() * 0.5 // 0-50%
 	jitter := time.Duration(float64(exponentialDelay) * jitterPercent)
-	
+
 	finalDelay := exponentialDelay + jitter
-	
+
 	tm.logger.Debug().
 		Str("taskID", taskID).
 		Int("concurrencyRetries", retries+1).
 		Dur("backoffDelay", finalDelay).
 		Msg("[tms] Concurrency backoff calculated")
-	
+
 	return finalDelay
 }
 
@@ -1904,8 +2013,11 @@ func (tm *TaskManagerSimple) Shutdown() {
 		}
 		return
 	}
+	tm.logger.Debug().Str("instance", tm.instanceName).Msg("[tms] >>> Shutdown starting")
+
 	atomic.StoreInt32(&tm.shutdownRequest, 1)
 	close(tm.shutdownCh)
+	tm.logger.Debug().Str("instance", tm.instanceName).Msg("[tms] >>> Closed shutdownCh")
 
 	// Wake all dispatchers to ensure they check shutdown
 	for _, pd := range tm.providers {
@@ -1914,36 +2026,55 @@ func (tm *TaskManagerSimple) Shutdown() {
 		pd.taskQueueCond.Broadcast()
 		pd.taskQueueLock.Unlock()
 	}
+	tm.logger.Debug().Str("instance", tm.instanceName).Msg("[tms] >>> Broadcasted to all providers")
 
+	tm.logger.Debug().Str("instance", tm.instanceName).Msg("[tms] >>> Waiting for wg.Wait()...")
 	tm.wg.Wait()
+	tm.logger.Debug().Str("instance", tm.instanceName).Msg("[tms] >>> wg.Wait() complete")
 	atomic.StoreInt32(&tm.isRunning, 0)
 
 	// Distributed cleanup
 	if tm.redisClient != nil {
+		tm.logger.Debug().Str("instance", tm.instanceName).Msg("[tms] >>> Starting distributed cleanup")
+
+		// Close config pubsub FIRST to unblock subscribeConfigUpdates before checking shutdownCh
+		if tm.configPubSub != nil {
+			tm.logger.Debug().Str("instance", tm.instanceName).Msg("[tms] >>> Closing configPubSub")
+			_ = tm.configPubSub.Close()
+			tm.logger.Debug().Str("instance", tm.instanceName).Msg("[tms] >>> configPubSub closed")
+		}
+
 		// Stop heartbeat
-		tm.stopHeartbeat()
+		if tm.heartbeatStop != nil {
+			tm.logger.Debug().Str("instance", tm.instanceName).Msg("[tms] >>> Closing heartbeatStop")
+			close(tm.heartbeatStop)
+		}
 
 		// Release master lock if we're the master
-		if tm.isMaster {
+		if tm.isMaster && tm.lockRenewalStop != nil {
+			tm.logger.Debug().Str("instance", tm.instanceName).Msg("[tms] >>> Closing lockRenewalStop")
 			close(tm.lockRenewalStop)
 			tm.releaseMasterLock()
 		}
 
 		// Release all Redis slots held by this instance
 		if tm.slotCoordinator != nil {
+			tm.logger.Debug().Str("instance", tm.instanceName).Msg("[tms] >>> Releasing all slots")
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			tm.slotCoordinator.ReleaseAllSlots(ctx)
 			cancel()
+			tm.logger.Debug().Str("instance", tm.instanceName).Msg("[tms] >>> Slots released")
 		}
 
 		// Close Redis client
+		tm.logger.Debug().Str("instance", tm.instanceName).Msg("[tms] >>> Closing Redis client")
 		if err := tm.redisClient.Close(); err != nil {
 			tm.logger.Error().
 				Err(err).
 				Str("instance", tm.instanceName).
 				Msg("[tms|distributed] Failed to close Redis client")
 		} else {
-			tm.logger.Info().
+			tm.logger.Debug().
 				Str("instance", tm.instanceName).
 				Msg("[tms|distributed] Redis client closed")
 		}
@@ -2197,7 +2328,7 @@ func InitTaskQueueSlave(
 				if localProvider, exists := localProviderMap[providerConfig.Name]; exists {
 					matchedProviders = append(matchedProviders, localProvider)
 					matchedServers[providerConfig.Name] = config.Servers[providerConfig.Name]
-					logger.Info().
+					logger.Debug().
 						Str("provider", providerConfig.Name).
 						Int("servers", len(config.Servers[providerConfig.Name])).
 						Msg("[tms|distributed] Matched provider")
@@ -2217,7 +2348,7 @@ func InitTaskQueueSlave(
 					for serverURL := range config.ServerLimits {
 						tm.masterControlledServers[serverURL] = true
 					}
-					logger.Info().
+					logger.Debug().
 						Str("instance", tm.instanceName).
 						Int("masterServers", len(config.ServerLimits)).
 						Msg("[tms|distributed] Tracked Master-controlled servers")
@@ -2303,7 +2434,7 @@ func InitTaskQueueManager(
 
 	tm := NewTaskManagerSimple(providers, servers, logger, getTimeout)
 	tm.Start()
-	
+
 	// Use atomic store for lock-free access
 	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&TaskQueueManagerInstance)), unsafe.Pointer(tm))
 

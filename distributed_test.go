@@ -141,6 +141,259 @@ done:
 	t.Log("✓ All slots released correctly")
 }
 
+// TestMasterSlaveSlotContention tests Master + Slave competing for same slots
+func TestMasterSlaveSlotContention(t *testing.T) {
+	redisAddr := "localhost:6379"
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: redisAddr,
+		DB:   15,
+	})
+	defer redisClient.Close()
+
+	ctx := context.Background()
+	if err := redisClient.FlushDB(ctx).Err(); err != nil {
+		t.Skipf("Redis not available at %s: %v", redisAddr, err)
+	}
+
+	logger := zerolog.New(zerolog.NewConsoleWriter()).Level(zerolog.InfoLevel)
+
+	// Single shared server with 2 slots
+	provider1 := &MockProviderDistributed{name: "provider1", processTime: 200 * time.Millisecond, failRate: 0}
+	providers := []IProvider{provider1}
+	servers := map[string][]string{
+		"provider1": {"https://---shared.com"},
+	}
+
+	// Initialize Master
+	masterCfg := ConfigOptions{
+		RedisAddr:    redisAddr,
+		RedisDB:      15,
+		InstanceName: "sk-main",
+	}
+
+	err := InitTaskQueueManagerMaster(masterCfg, &logger, &providers, nil, servers, func(string, string) time.Duration {
+		return 10 * time.Second
+	})
+	if err != nil {
+		t.Fatalf("Failed to init master: %v", err)
+	}
+
+	masterTM := GetTaskQueueManagerInstance()
+
+	// Keep server limit at 1 (don't override)
+	// This is the actual production scenario Flo reported
+
+	time.Sleep(300 * time.Millisecond) // Let Master publish config
+
+	// Initialize Slave directly (not via global Init)
+	slaveCfg := ConfigOptions{
+		RedisAddr:    redisAddr,
+		RedisDB:      15,
+		InstanceName: "sk-dev",
+	}
+
+	slaveTM := NewTaskManagerSimple(&providers, servers, &logger, func(string, string) time.Duration {
+		return 10 * time.Second
+	})
+
+	if err := slaveTM.initRedisClient(&slaveCfg); err != nil {
+		t.Fatalf("Failed to init slave Redis: %v", err)
+	}
+
+	slaveTM.cleanupGhostInstance()
+	slaveTM.heartbeatStop = make(chan struct{})
+
+	if slaveTM.redisClient != nil {
+		go slaveTM.subscribeConfigUpdates()
+		go slaveTM.startHeartbeat()
+		go slaveTM.monitorDeadInstances()
+	}
+
+	slaveTM.Start()
+
+	// Shutdown cleanup
+	defer func() {
+		t.Log(">>> Starting Slave shutdown...")
+		slaveTM.Shutdown()
+		t.Log(">>> Slave shutdown complete")
+
+		t.Log(">>> Starting Master shutdown...")
+		masterTM.Shutdown()
+		t.Log(">>> Master shutdown complete")
+	}()
+
+	// Submit 20 tasks to Master
+	var masterTasks []*MockTaskDistributed
+	for i := 0; i < 20; i++ {
+		task := &MockTaskDistributed{
+			id:       fmt.Sprintf("master-task-batch1-%d", i),
+			provider: provider1,
+			priority: 0,
+		}
+		masterTasks = append(masterTasks, task)
+		masterTM.AddTask(task)
+	}
+
+	t.Logf("Submitted batch 1: %d tasks to Master", len(masterTasks))
+
+	// Submit 4 tasks to Slave (should compete for slots)
+	var slaveTasks []*MockTaskDistributed
+	for i := 0; i < 4; i++ {
+		task := &MockTaskDistributed{
+			id:       fmt.Sprintf("slave-task-%d", i),
+			provider: provider1,
+			priority: 0,
+		}
+		slaveTasks = append(slaveTasks, task)
+		slaveTM.AddTask(task)
+	}
+
+	t.Logf("Submitted %d tasks to Slave", len(slaveTasks))
+
+	// Submit 100 MORE tasks to Master (flood)
+	for i := 0; i < 100; i++ {
+		task := &MockTaskDistributed{
+			id:       fmt.Sprintf("master-task-batch2-%d", i),
+			provider: provider1,
+			priority: 0,
+		}
+		masterTasks = append(masterTasks, task)
+		masterTM.AddTask(task)
+	}
+
+	t.Logf("Submitted batch 2: 100 MORE tasks to Master (total: %d)", len(masterTasks))
+
+	// Track when Slave tasks start
+	var slaveTaskStartTime time.Time
+	var slaveTaskStartIndex int
+	slaveTaskStarted := make(chan struct{}, 1)
+	sampleDone := make(chan struct{})
+
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-sampleDone:
+				return
+			case <-ticker.C:
+				for _, task := range slaveTasks {
+					if task.IsCompleted() && slaveTaskStartTime.IsZero() {
+						slaveTaskStartTime = time.Now()
+						// Count how many Master tasks completed before first Slave task
+						masterCompleted := 0
+						for _, mt := range masterTasks {
+							if mt.IsCompleted() {
+								masterCompleted++
+							}
+						}
+						slaveTaskStartIndex = masterCompleted
+						select {
+						case slaveTaskStarted <- struct{}{}:
+						default:
+						}
+						t.Logf("⚠️  FIRST SLAVE TASK completed after %d Master tasks finished", masterCompleted)
+						break
+					}
+				}
+			}
+		}
+	}()
+
+	// Wait for ALL tasks to complete
+	timeout := time.After(60 * time.Second)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			t.Log(">>> Timeout triggered")
+			close(sampleDone)
+
+			// Check which tasks completed
+			masterCompleted := 0
+			slaveCompleted := 0
+			for _, task := range masterTasks {
+				if task.IsCompleted() {
+					masterCompleted++
+				}
+			}
+			for _, task := range slaveTasks {
+				if task.IsCompleted() {
+					slaveCompleted++
+				}
+			}
+
+			t.Fatalf("Timeout: Master %d/%d completed, Slave %d/%d completed (SLAVE STARVED?)",
+				masterCompleted, len(masterTasks), slaveCompleted, len(slaveTasks))
+
+		case <-ticker.C:
+			t.Log(">>> Ticker fired")
+			masterCompleted := 0
+			slaveCompleted := 0
+			for _, task := range masterTasks {
+				if task.IsCompleted() {
+					masterCompleted++
+				}
+			}
+			for _, task := range slaveTasks {
+				if task.IsCompleted() {
+					slaveCompleted++
+				}
+			}
+
+			if masterCompleted == len(masterTasks) && slaveCompleted == len(slaveTasks) {
+				t.Log(">>> All tasks complete, exiting loop")
+				close(sampleDone)
+				goto done
+			}
+
+			t.Logf(">>> Progress: Master %d/%d, Slave %d/%d",
+				masterCompleted, len(masterTasks), slaveCompleted, len(slaveTasks))
+		}
+	}
+
+done:
+	// Verify all tasks completed
+	masterSuccess := 0
+	slaveSuccess := 0
+	for _, task := range masterTasks {
+		if task.succeeded {
+			masterSuccess++
+		}
+	}
+	for _, task := range slaveTasks {
+		if task.succeeded {
+			slaveSuccess++
+		}
+	}
+
+	if masterSuccess != len(masterTasks) {
+		t.Errorf("Master: Expected %d successes, got %d", len(masterTasks), masterSuccess)
+	}
+
+	if slaveSuccess != len(slaveTasks) {
+		t.Errorf("Slave: Expected %d successes, got %d (SLAVE STARVED)", len(slaveTasks), slaveSuccess)
+	}
+
+	t.Logf("✓ Master: %d/%d completed", masterSuccess, len(masterTasks))
+	t.Logf("✓ Slave: %d/%d completed", slaveSuccess, len(slaveTasks))
+
+	if !slaveTaskStartTime.IsZero() {
+		t.Logf("⚠️  Slave starvation detected:")
+		t.Logf("    - First Slave task completed AFTER %d/%d Master tasks finished", slaveTaskStartIndex, len(masterTasks))
+		t.Logf("    - Slave had to wait for %.1f%% of Master queue to drain",
+			float64(slaveTaskStartIndex)/float64(len(masterTasks))*100)
+
+		if slaveTaskStartIndex > 10 {
+			t.Errorf("STARVATION BUG: Slave waited for %d Master tasks - no fairness!", slaveTaskStartIndex)
+		}
+	} else {
+		t.Log("✓ Slave tasks got slots fairly (started before all Master tasks)")
+	}
+}
+
 // TestDistributedMasterSlave tests master + 1 slave coordination
 // NOTE: Multi-instance tests have shutdown race conditions when run in same process
 // For real testing, run Master and Slave as separate processes
