@@ -61,33 +61,6 @@ While the architecture is strong, a few areas could be considered for future ref
 -   **Impact**: This is an O(N*M) operation in the worst case (where N is the number of providers and M is the number of tasks in a queue). While acceptable for a small number of providers, it will not scale well if the system grows to manage dozens or hundreds of provider types.
 -   **Recommendation**: To achieve O(1) lookup, consider adding a global `sync.Map` that maps a `taskID` to the name of the `providerName` that owns it. When a task is added, you would store its location in this map. `DelTask` could then instantly find the correct provider's queue to lock and search, dramatically improving performance.
 
-### 3.3. Code Maintainability
-
-#### Suggestion: Decompose the `ITask` Interface
--   **Observation**: The `ITask` interface is quite large, mixing several concerns: identity (`GetID`), routing (`GetProvider`), scheduling (`GetPriority`), lifecycle (`MarkAsSuccess`), and configuration (`GetMaxRetries`, `GetTimeout`).
--   **Impact**: Large interfaces can be cumbersome to implement. For example, every task, including a simple one-shot job, must implement methods for retries and timeouts.
--   **Recommendation**: For future versions, consider decomposing the interface. One possible approach:
-    ```go
-    type ITask interface {
-        GetID() string
-        GetProvider() IProvider
-        // ... core methods
-    }
-
-    // Optional interfaces a task can implement
-    type ITaskWithPriority interface {
-        GetPriority() int
-    }
-
-    type ITaskWithRetries interface {
-        GetMaxRetries() int
-        // ...
-    }
-    ```
-    The task manager could then use type assertions to check if a task supports these advanced features and apply default behavior if not. This would make simple tasks easier to define while retaining flexibility. (Note: This is a significant change and should be weighed against the simplicity of the current approach).
-
----
-
 ## 4. Conclusion
 
 The SMT project is a well-engineered, high-performance task scheduler. Its strengths in concurrency, performance, and scheduling logic are impressive. The recommendations in this report are not critical flaws but rather suggestions for refinement that could further enhance the system's scalability, testability, and long-term maintainability as it evolves. The current architecture provides an excellent foundation for a production-ready system.
