@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
@@ -91,11 +92,14 @@ type TaskManagerSimple struct {
 	taskToProvider       sync.Map                 // Map taskID (string) -> providerName (string) for O(1) lookup
 
 	// Distributed coordination fields
-	redisClient          *redis.Client
-	instanceName         string
-	isMaster             bool
-	heartbeatStop        chan struct{}
-	lockRenewalStop      chan struct{}
+	redisClient              *redis.Client
+	instanceName             string
+	isMaster                 bool
+	heartbeatStop            chan struct{}
+	lockRenewalStop          chan struct{}
+	slotCoordinator          *RedisSlotCoordinator
+	masterControlledServers  map[string]bool // Servers controlled by Master (slaves can't modify these)
+	masterControlledServersMu sync.RWMutex
 }
 
 type ProviderData struct {
@@ -110,6 +114,249 @@ type ProviderData struct {
 	commandQueue   *CommandQueue
 	commandSet     map[uuid.UUID]struct{}
 	commandSetLock sync.Mutex
+}
+
+// ProviderConfig holds serializable provider configuration for Redis
+type ProviderConfig struct {
+	Name    string   `json:"name"`
+	Servers []string `json:"servers"`
+}
+
+// SerializedConfig holds the complete configuration for Redis storage
+type SerializedConfig struct {
+	Providers    []ProviderConfig    `json:"providers"`
+	Servers      map[string][]string `json:"servers"`
+	ServerLimits map[string]int      `json:"server_limits"` // server URL -> max concurrency
+	Version      int64               `json:"version"`
+}
+
+// RedisSlotCoordinator handles distributed slot coordination via Redis
+type RedisSlotCoordinator struct {
+	client       *redis.Client
+	instanceName string
+	localSlots   sync.Map // map[serverURL]int - tracks slots held by this instance
+	logger       *zerolog.Logger
+}
+
+// Lua script for atomic slot acquisition
+const luaAcquireSlot = `
+local max_key = KEYS[1]
+local acquired_key = KEYS[2]
+local holders_key = KEYS[3]
+local instance_name = ARGV[1]
+
+local max = tonumber(redis.call('GET', max_key))
+if not max then
+    return -1  -- No limit set
+end
+
+local acquired = tonumber(redis.call('GET', acquired_key) or "0")
+if acquired < max then
+    redis.call('INCR', acquired_key)
+    redis.call('HINCRBY', holders_key, instance_name, 1)
+    redis.call('EXPIRE', holders_key, 300)  -- 5 min TTL for cleanup
+    return 1  -- Success
+end
+return 0  -- Limit reached
+`
+
+// Lua script for atomic slot release
+const luaReleaseSlot = `
+local acquired_key = KEYS[1]
+local holders_key = KEYS[2]
+local instance_name = ARGV[1]
+
+local holder_count = tonumber(redis.call('HGET', holders_key, instance_name) or "0")
+if holder_count > 0 then
+    redis.call('DECR', acquired_key)
+    redis.call('HINCRBY', holders_key, instance_name, -1)
+
+    -- Remove holder if count reaches 0
+    if holder_count == 1 then
+        redis.call('HDEL', holders_key, instance_name)
+    end
+    return 1  -- Success
+end
+return 0  -- Instance didn't hold any slots
+`
+
+// NewRedisSlotCoordinator creates a new distributed slot coordinator
+func NewRedisSlotCoordinator(client *redis.Client, instanceName string, logger *zerolog.Logger) *RedisSlotCoordinator {
+	return &RedisSlotCoordinator{
+		client:       client,
+		instanceName: instanceName,
+		logger:       logger,
+	}
+}
+
+// AcquireSlot attempts to acquire a slot for the given server
+func (rsc *RedisSlotCoordinator) AcquireSlot(ctx context.Context, serverURL string) bool {
+	maxKey := fmt.Sprintf("smt:slots:%s:max", serverURL)
+	acquiredKey := fmt.Sprintf("smt:slots:%s:acquired", serverURL)
+	holdersKey := fmt.Sprintf("smt:slots:%s:holders", serverURL)
+
+	result, err := rsc.client.Eval(ctx, luaAcquireSlot,
+		[]string{maxKey, acquiredKey, holdersKey},
+		rsc.instanceName).Int()
+
+	if err != nil {
+		rsc.logger.Error().
+			Err(err).
+			Str("server", serverURL).
+			Str("instance", rsc.instanceName).
+			Msg("[tms|redis-slots] Failed to acquire slot")
+		return false
+	}
+
+	if result == -1 {
+		// No limit set in Redis - shouldn't happen but treat as success
+		rsc.logger.Warn().
+			Str("server", serverURL).
+			Msg("[tms|redis-slots] No max limit found in Redis")
+		return true
+	}
+
+	if result == 1 {
+		// Success - track locally for cleanup
+		count, _ := rsc.localSlots.LoadOrStore(serverURL, 0)
+		rsc.localSlots.Store(serverURL, count.(int)+1)
+
+		rsc.logger.Debug().
+			Str("server", serverURL).
+			Str("instance", rsc.instanceName).
+			Msg("[tms|redis-slots] Acquired slot")
+		return true
+	}
+
+	// result == 0 means limit reached
+	return false
+}
+
+// ReleaseSlot releases a slot for the given server
+func (rsc *RedisSlotCoordinator) ReleaseSlot(ctx context.Context, serverURL string) {
+	acquiredKey := fmt.Sprintf("smt:slots:%s:acquired", serverURL)
+	holdersKey := fmt.Sprintf("smt:slots:%s:holders", serverURL)
+
+	result, err := rsc.client.Eval(ctx, luaReleaseSlot,
+		[]string{acquiredKey, holdersKey},
+		rsc.instanceName).Int()
+
+	if err != nil {
+		rsc.logger.Error().
+			Err(err).
+			Str("server", serverURL).
+			Str("instance", rsc.instanceName).
+			Msg("[tms|redis-slots] Failed to release slot")
+		return
+	}
+
+	if result == 1 {
+		// Success - update local tracking
+		if count, ok := rsc.localSlots.Load(serverURL); ok {
+			newCount := count.(int) - 1
+			if newCount <= 0 {
+				rsc.localSlots.Delete(serverURL)
+			} else {
+				rsc.localSlots.Store(serverURL, newCount)
+			}
+		}
+
+		rsc.logger.Debug().
+			Str("server", serverURL).
+			Str("instance", rsc.instanceName).
+			Msg("[tms|redis-slots] Released slot")
+	}
+}
+
+// ReleaseAllSlots releases all slots held by this instance
+// Scans Redis for slots held by this instanceName (for ghost cleanup)
+// Also releases slots tracked in localSlots (for graceful shutdown)
+func (rsc *RedisSlotCoordinator) ReleaseAllSlots(ctx context.Context) {
+	rsc.logger.Info().
+		Str("instance", rsc.instanceName).
+		Msg("[tms|redis-slots] Releasing all slots")
+
+	var totalReleased int
+
+	// 1. Scan Redis for slots held by this instance (handles ghost cleanup)
+	pattern := "smt:slots:*:holders"
+	var cursor uint64
+
+	for {
+		keys, nextCursor, err := rsc.client.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			rsc.logger.Error().
+				Err(err).
+				Msg("[tms|redis-slots] Failed to scan for holders")
+			break
+		}
+
+		for _, holdersKey := range keys {
+			// Check if this instance is in holders hash
+			count, err := rsc.client.HGet(ctx, holdersKey, rsc.instanceName).Int()
+			if err == redis.Nil {
+				continue
+			} else if err != nil {
+				continue
+			}
+
+			if count > 0 {
+				// Extract server URL from key: smt:slots:{serverURL}:holders
+				parts := strings.Split(holdersKey, ":")
+				if len(parts) >= 3 {
+					serverURL := strings.Join(parts[2:len(parts)-1], ":")
+
+					// Release slots via Lua script (atomically decrements acquired + removes holder)
+					for i := 0; i < count; i++ {
+						rsc.ReleaseSlot(ctx, serverURL)
+					}
+					totalReleased += count
+				}
+			}
+		}
+
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
+	}
+
+	// 2. Also release slots tracked in localSlots (for graceful shutdown)
+	rsc.localSlots.Range(func(key, value interface{}) bool {
+		serverURL := key.(string)
+		count := value.(int)
+
+		// Release each slot we hold
+		for i := 0; i < count; i++ {
+			rsc.ReleaseSlot(ctx, serverURL)
+		}
+		totalReleased += count
+
+		return true
+	})
+
+	if totalReleased > 0 {
+		rsc.logger.Info().
+			Str("instance", rsc.instanceName).
+			Int("slotsReleased", totalReleased).
+			Msg("[tms|redis-slots] Released all slots")
+	}
+}
+
+// SetServerMaxConcurrency sets the maximum concurrency for a server in Redis
+func (rsc *RedisSlotCoordinator) SetServerMaxConcurrency(ctx context.Context, serverURL string, maxConcurrency int) error {
+	maxKey := fmt.Sprintf("smt:slots:%s:max", serverURL)
+
+	if err := rsc.client.Set(ctx, maxKey, maxConcurrency, 0).Err(); err != nil {
+		return fmt.Errorf("failed to set max concurrency: %w", err)
+	}
+
+	rsc.logger.Info().
+		Str("server", serverURL).
+		Int("maxConcurrency", maxConcurrency).
+		Msg("[tms|redis-slots] Set server max concurrency")
+
+	return nil
 }
 
 // generateInstanceName creates a unique instance identifier
@@ -157,7 +404,271 @@ func (tm *TaskManagerSimple) initRedisClient(cfg *ConfigOptions) error {
 		Str("redis", cfg.RedisAddr).
 		Msg("[tms|distributed] Connected to Redis")
 
+	// Initialize slot coordinator for distributed concurrency
+	tm.slotCoordinator = NewRedisSlotCoordinator(tm.redisClient, tm.instanceName, tm.logger)
+
 	return nil
+}
+
+// serializeConfig converts providers, servers, and slot limits to JSON for Redis storage
+func serializeConfig(providers *[]IProvider, servers map[string][]string, serverLimits map[string]int) ([]byte, error) {
+	if providers == nil || servers == nil {
+		return nil, fmt.Errorf("providers and servers cannot be nil")
+	}
+
+	// Build provider configs
+	providerConfigs := make([]ProviderConfig, 0, len(*providers))
+	for _, provider := range *providers {
+		providerName := provider.Name()
+		serverList, ok := servers[providerName]
+		if !ok {
+			serverList = []string{}
+		}
+		providerConfigs = append(providerConfigs, ProviderConfig{
+			Name:    providerName,
+			Servers: serverList,
+		})
+	}
+
+	// Create serialized config with version and server limits
+	config := SerializedConfig{
+		Providers:    providerConfigs,
+		Servers:      servers,
+		ServerLimits: serverLimits,
+		Version:      time.Now().Unix(), // Use timestamp as version
+	}
+
+	// Marshal to JSON
+	data, err := json.Marshal(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	return data, nil
+}
+
+// deserializeConfig parses JSON config from Redis
+func deserializeConfig(data []byte) (*SerializedConfig, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty config data")
+	}
+
+	var config SerializedConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+
+	return &config, nil
+}
+
+// validateConfig checks if config is well-formed
+func validateConfig(config *SerializedConfig) error {
+	if config == nil {
+		return fmt.Errorf("config is nil")
+	}
+
+	if len(config.Providers) == 0 {
+		return fmt.Errorf("config has no providers")
+	}
+
+	// Check each provider has a name
+	for i, provider := range config.Providers {
+		if provider.Name == "" {
+			return fmt.Errorf("provider at index %d has empty name", i)
+		}
+	}
+
+	// Servers map can be empty (providers without servers)
+	if config.Servers == nil {
+		return fmt.Errorf("servers map is nil")
+	}
+
+	return nil
+}
+
+// publishConfig stores config in Redis and notifies slaves via Pub/Sub
+func (tm *TaskManagerSimple) publishConfig(providers *[]IProvider, servers map[string][]string) error {
+	if tm.redisClient == nil {
+		return fmt.Errorf("Redis client not initialized")
+	}
+
+	// Extract server limits from serverConcurrencyMap
+	tm.serverConcurrencyMu.RLock()
+	serverLimits := make(map[string]int, len(tm.serverConcurrencyMap))
+	for serverURL, semaphore := range tm.serverConcurrencyMap {
+		serverLimits[serverURL] = cap(semaphore)
+	}
+	tm.serverConcurrencyMu.RUnlock()
+
+	// Serialize config with server limits
+	configData, err := serializeConfig(providers, servers, serverLimits)
+	if err != nil {
+		return fmt.Errorf("failed to serialize config: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Store config in Redis
+	if err := tm.redisClient.Set(ctx, "smt:config:data", configData, 0).Err(); err != nil {
+		return fmt.Errorf("failed to store config: %w", err)
+	}
+
+	// Publish notification to Pub/Sub channel
+	if err := tm.redisClient.Publish(ctx, "smt:config:updates", "config_updated").Err(); err != nil {
+		tm.logger.Warn().
+			Err(err).
+			Str("instance", tm.instanceName).
+			Msg("[tms|distributed] Failed to publish config update notification")
+		// Non-fatal - config is stored, slaves will get it eventually
+	}
+
+	tm.logger.Info().
+		Str("instance", tm.instanceName).
+		Int("providers", len(*providers)).
+		Int("serverLimits", len(serverLimits)).
+		Msg("[tms|distributed] Published config to Redis")
+
+	return nil
+}
+
+// loadConfigFromRedis pulls config from Redis (used by slaves)
+func (tm *TaskManagerSimple) loadConfigFromRedis() (*SerializedConfig, error) {
+	if tm.redisClient == nil {
+		return nil, fmt.Errorf("Redis client not initialized")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Get config from Redis
+	configData, err := tm.redisClient.Get(ctx, "smt:config:data").Bytes()
+	if err == redis.Nil {
+		return nil, fmt.Errorf("no config found in Redis - master may not be initialized yet")
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Deserialize
+	config, err := deserializeConfig(configData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to deserialize config: %w", err)
+	}
+
+	// Validate
+	if err := validateConfig(config); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
+	return config, nil
+}
+
+// subscribeConfigUpdates listens for config changes via Pub/Sub
+func (tm *TaskManagerSimple) subscribeConfigUpdates() {
+	if tm.redisClient == nil {
+		return
+	}
+
+	ctx := context.Background()
+	pubsub := tm.redisClient.Subscribe(ctx, "smt:config:updates")
+	defer pubsub.Close()
+
+	tm.logger.Info().
+		Str("instance", tm.instanceName).
+		Msg("[tms|distributed] Subscribed to config updates")
+
+	// Wait for subscription confirmation
+	_, err := pubsub.Receive(ctx)
+	if err != nil {
+		tm.logger.Error().
+			Err(err).
+			Str("instance", tm.instanceName).
+			Msg("[tms|distributed] Failed to confirm subscription")
+		return
+	}
+
+	// Listen for messages
+	ch := pubsub.Channel()
+	for {
+		select {
+		case <-tm.shutdownCh:
+			tm.logger.Info().
+				Str("instance", tm.instanceName).
+				Msg("[tms|distributed] Config subscription shutting down")
+			return
+		case msg := <-ch:
+			if msg == nil {
+				continue
+			}
+
+			tm.logger.Info().
+				Str("instance", tm.instanceName).
+				Str("message", msg.Payload).
+				Msg("[tms|distributed] Received config update notification")
+
+			// Load new config from Redis
+			config, err := tm.loadConfigFromRedis()
+			if err != nil {
+				tm.logger.Error().
+					Err(err).
+					Str("instance", tm.instanceName).
+					Msg("[tms|distributed] Failed to load updated config")
+				continue
+			}
+
+			// Update master-controlled servers list
+			if config.ServerLimits != nil && len(config.ServerLimits) > 0 {
+				tm.masterControlledServersMu.Lock()
+				if tm.masterControlledServers == nil {
+					tm.masterControlledServers = make(map[string]bool)
+				}
+				for serverURL := range config.ServerLimits {
+					tm.masterControlledServers[serverURL] = true
+				}
+				tm.masterControlledServersMu.Unlock()
+
+				// Apply server limit hot-reload
+				tm.serverConcurrencyMu.Lock()
+				updatedCount := 0
+				for serverURL, newLimit := range config.ServerLimits {
+					// Check if this is a Master-controlled server or slave-only server
+					// If we don't have this server locally, it's Master-controlled - skip
+					if _, exists := tm.serverConcurrencyMap[serverURL]; !exists {
+						// This is a Master-controlled server we don't have locally
+						continue
+					}
+
+					// Update local limit
+					oldLimit := cap(tm.serverConcurrencyMap[serverURL])
+					if oldLimit != newLimit {
+						tm.serverConcurrencyMap[serverURL] = make(chan struct{}, newLimit)
+						updatedCount++
+
+						tm.logger.Info().
+							Str("server", serverURL).
+							Int("oldLimit", oldLimit).
+							Int("newLimit", newLimit).
+							Str("instance", tm.instanceName).
+							Msg("[tms|distributed] Updated server concurrency limit")
+					}
+				}
+				tm.serverConcurrencyMu.Unlock()
+
+				if updatedCount > 0 {
+					tm.logger.Info().
+						Str("instance", tm.instanceName).
+						Int("updated", updatedCount).
+						Msg("[tms|distributed] Applied server limit hot-reload")
+				}
+			}
+
+			tm.logger.Info().
+				Str("instance", tm.instanceName).
+				Int64("version", config.Version).
+				Int("providers", len(config.Providers)).
+				Msg("[tms|distributed] Config hot-reload received")
+		}
+	}
 }
 
 // acquireMasterLock attempts to acquire the master lock in Redis
@@ -414,14 +925,132 @@ func (tm *TaskManagerSimple) cleanupDeadInstance(instanceName string) {
 		Str("deadInstance", instanceName).
 		Msg("[tms|distributed] Starting cleanup for dead instance")
 
-	// Phase 3 will implement slot cleanup here
-	// For now, just log that we detected the crash
-	// TODO: Scan smt:slots:*:holders and remove instanceName entries
-	// TODO: Use ctx with timeout when implementing slot cleanup
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Scan for all slot holder hashes
+	pattern := "smt:slots:*:holders"
+	var cursor uint64
+	var cleanedSlots int
+
+	for {
+		keys, nextCursor, err := tm.redisClient.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			tm.logger.Error().
+				Err(err).
+				Str("deadInstance", instanceName).
+				Msg("[tms|distributed] Failed to scan for slot holders")
+			break
+		}
+
+		for _, holdersKey := range keys {
+			// Check if dead instance is in this holders hash
+			count, err := tm.redisClient.HGet(ctx, holdersKey, instanceName).Int()
+			if err == redis.Nil {
+				// Instance not in this hash
+				continue
+			} else if err != nil {
+				tm.logger.Error().
+					Err(err).
+					Str("holdersKey", holdersKey).
+					Str("deadInstance", instanceName).
+					Msg("[tms|distributed] Failed to check holder")
+				continue
+			}
+
+			if count > 0 {
+				// Dead instance held slots - clean them up
+				// Extract server URL from key: smt:slots:{serverURL}:holders
+				parts := strings.Split(holdersKey, ":")
+				if len(parts) >= 3 {
+					serverURL := strings.Join(parts[2:len(parts)-1], ":")
+
+					// Decrement acquired count by the number of slots held
+					acquiredKey := fmt.Sprintf("smt:slots:%s:acquired", serverURL)
+					_, err := tm.redisClient.DecrBy(ctx, acquiredKey, int64(count)).Result()
+					if err != nil {
+						tm.logger.Error().
+							Err(err).
+							Str("server", serverURL).
+							Str("deadInstance", instanceName).
+							Msg("[tms|distributed] Failed to decrement acquired count")
+					}
+
+					// Remove dead instance from holders hash
+					err = tm.redisClient.HDel(ctx, holdersKey, instanceName).Err()
+					if err != nil {
+						tm.logger.Error().
+							Err(err).
+							Str("holdersKey", holdersKey).
+							Str("deadInstance", instanceName).
+							Msg("[tms|distributed] Failed to remove holder")
+					} else {
+						cleanedSlots += count
+						tm.logger.Info().
+							Str("server", serverURL).
+							Str("deadInstance", instanceName).
+							Int("slotsReleased", count).
+							Msg("[tms|distributed] Released slots from dead instance")
+					}
+				}
+			}
+		}
+
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
+	}
 
 	tm.logger.Info().
 		Str("deadInstance", instanceName).
+		Int("totalSlotsReleased", cleanedSlots).
 		Msg("[tms|distributed] Cleanup complete for dead instance")
+}
+
+// cleanupGhostInstance cleans up resources from previous run of THIS instance
+// Called on startup to prevent slot leaks from hard restarts within heartbeat TTL
+func (tm *TaskManagerSimple) cleanupGhostInstance() {
+	if tm.redisClient == nil || tm.instanceName == "" {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Delete old master lock if held by this instanceName
+	lockKey := "smt:master:lock"
+	currentHolder, err := tm.redisClient.Get(ctx, lockKey).Result()
+	if err == nil && currentHolder == tm.instanceName {
+		// Lock is held by previous run of this instance - release it
+		err = tm.redisClient.Del(ctx, lockKey).Err()
+		if err != nil && err != redis.Nil {
+			tm.logger.Warn().
+				Err(err).
+				Str("instance", tm.instanceName).
+				Msg("[tms|distributed] Failed to delete ghost master lock")
+		}
+	}
+
+	// Delete old heartbeat key
+	heartbeatKey := fmt.Sprintf("smt:instances:%s:heartbeat", tm.instanceName)
+	err = tm.redisClient.Del(ctx, heartbeatKey).Err()
+	if err != nil && err != redis.Nil {
+		tm.logger.Warn().
+			Err(err).
+			Str("instance", tm.instanceName).
+			Msg("[tms|distributed] Failed to delete ghost heartbeat")
+	}
+
+	// Release all slots held by previous instance with same name
+	// SlotCoordinator tracks localSlots in-memory, empty on fresh start
+	// ReleaseAllSlots scans Redis for slots held by this instanceName
+	if tm.slotCoordinator != nil {
+		tm.slotCoordinator.ReleaseAllSlots(ctx)
+		tm.logger.Info().
+			Str("instance", tm.instanceName).
+			Msg("[tms|distributed] Cleaned up ghost instance resources")
+	}
 }
 
 func NewTaskManagerSimple(
@@ -493,12 +1122,52 @@ func NewTaskManagerSimple(
 
 
 func (tm *TaskManagerSimple) SetTaskManagerServerMaxParallel(prefix string, maxParallel int) {
+	// Check if this is a slave trying to modify Master-controlled server
+	if !tm.isMaster && tm.slotCoordinator != nil {
+		tm.masterControlledServersMu.RLock()
+		isMasterControlled := tm.masterControlledServers[prefix]
+		tm.masterControlledServersMu.RUnlock()
+
+		if isMasterControlled {
+			tm.logger.Warn().
+				Str("server", prefix).
+				Str("instance", tm.instanceName).
+				Msg("[tms] Slave ignoring SetTaskManagerServerMaxParallel for Master-controlled server")
+			return
+		}
+	}
+
+	// Update local concurrency map
 	tm.serverConcurrencyMu.Lock()
-	defer tm.serverConcurrencyMu.Unlock()
 	if maxParallel <= 0 {
 		delete(tm.serverConcurrencyMap, prefix)
 	} else {
 		tm.serverConcurrencyMap[prefix] = make(chan struct{}, maxParallel)
+	}
+	tm.serverConcurrencyMu.Unlock()
+
+	// Sync to Redis if distributed mode
+	if tm.slotCoordinator != nil && maxParallel > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := tm.slotCoordinator.SetServerMaxConcurrency(ctx, prefix, maxParallel)
+		cancel()
+		if err != nil {
+			tm.logger.Error().
+				Err(err).
+				Str("server", prefix).
+				Str("instance", tm.instanceName).
+				Msg("[tms] Failed to sync slot limit to Redis")
+		}
+
+		// Master should publish updated config
+		if tm.isMaster {
+			// Republish config with updated limits
+			// Note: This triggers hot-reload on all slaves
+			tm.logger.Debug().
+				Str("server", prefix).
+				Int("maxParallel", maxParallel).
+				Msg("[tms] Master updated slot limit, republishing config")
+		}
 	}
 }
 
@@ -906,35 +1575,82 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 	pd, providerExists := tm.providers[providerName]
 
 	// 1) Acquire concurrency FIRST (non-blocking with retry).
-	semaphore, hasLimit := tm.getServerSemaphore(server)
-	if hasLimit {
-		// Try to acquire non-blocking first
-		select {
-		case semaphore <- struct{}{}:
+	// Use distributed coordination if available, otherwise fallback to local semaphores
+	var semaphore chan struct{}
+	var hasLimit bool
+	var usingRedis bool
+
+	// Normalize server URL for slot coordination
+	normalizedServer := server
+	if u, err := url.Parse(server); err == nil {
+		u.RawQuery = ""
+		u.Fragment = ""
+		normalizedServer = u.String()
+	}
+
+	if tm.slotCoordinator != nil {
+		// Distributed mode - use Redis coordination
+		usingRedis = true
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		acquired := tm.slotCoordinator.AcquireSlot(ctx, normalizedServer)
+		if !acquired {
+			// Limit reached - re-queue task
 			tm.logger.Debug().
-				Str("server", server).
+				Str("server", normalizedServer).
 				Str("taskID", taskID).
-				Msg("[tms|processTask] Acquired concurrency slot immediately!")
-		default:
-			// If blocked, return server and re-queue task
-			tm.logger.Debug().
-				Str("server", server).
-				Str("taskID", taskID).
-				Msg("[tms|processTask] Concurrency limit reached, re-queuing task")
-			
+				Msg("[tms|processTask] Redis slot limit reached, re-queuing task")
+
 			// Return server to pool
 			tm.returnServerToPool(providerExists, pd, server)
-			
+
 			// Re-queue without incrementing retry counter
-			// Concurrency limits shouldn't count as failures
 			tm.delTaskInQueue(task)
-			
-			// Calculate exponential backoff to prevent retry storms
+
+			// Calculate exponential backoff
 			backoffDelay := tm.calculateConcurrencyBackoff(taskID)
 			time.Sleep(backoffDelay)
-			
+
 			tm.AddTask(task)
 			return
+		}
+
+		tm.logger.Debug().
+			Str("server", normalizedServer).
+			Str("taskID", taskID).
+			Msg("[tms|processTask] Acquired Redis slot")
+	} else {
+		// Local mode - use channel semaphores
+		semaphore, hasLimit = tm.getServerSemaphore(server)
+		if hasLimit {
+			// Try to acquire non-blocking first
+			select {
+			case semaphore <- struct{}{}:
+				tm.logger.Debug().
+					Str("server", server).
+					Str("taskID", taskID).
+					Msg("[tms|processTask] Acquired local slot immediately")
+			default:
+				// If blocked, return server and re-queue task
+				tm.logger.Debug().
+					Str("server", server).
+					Str("taskID", taskID).
+					Msg("[tms|processTask] Local concurrency limit reached, re-queuing task")
+
+				// Return server to pool
+				tm.returnServerToPool(providerExists, pd, server)
+
+				// Re-queue without incrementing retry counter
+				tm.delTaskInQueue(task)
+
+				// Calculate exponential backoff
+				backoffDelay := tm.calculateConcurrencyBackoff(taskID)
+				time.Sleep(backoffDelay)
+
+				tm.AddTask(task)
+				return
+			}
 		}
 	}
 
@@ -945,14 +1661,24 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 	defer func() {
 		// Unregister running task
 		tm.unregisterRunningTask(taskID)
-		
+
 		// 4) Always release concurrency when done
-		if hasLimit {
+		if usingRedis {
+			// Release Redis slot
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			tm.slotCoordinator.ReleaseSlot(ctx, normalizedServer)
+			cancel()
+			tm.logger.Debug().
+				Str("server", normalizedServer).
+				Str("taskID", taskID).
+				Msg("[tms|processTask] Released Redis slot")
+		} else if hasLimit {
+			// Release local semaphore
 			<-semaphore
 			tm.logger.Debug().
 				Str("server", server).
 				Str("taskID", taskID).
-				Msg("[tms|processTask] Released concurrency slot!")
+				Msg("[tms|processTask] Released local slot")
 		}
 		// Return server to the pool
 		tm.returnServerToPool(providerExists, pd, server)
@@ -1203,7 +1929,12 @@ func (tm *TaskManagerSimple) Shutdown() {
 			tm.releaseMasterLock()
 		}
 
-		// TODO Phase 3: Release all Redis slots held by this instance
+		// Release all Redis slots held by this instance
+		if tm.slotCoordinator != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			tm.slotCoordinator.ReleaseAllSlots(ctx)
+			cancel()
+		}
 
 		// Close Redis client
 		if err := tm.redisClient.Close(); err != nil {
@@ -1354,6 +2085,9 @@ func InitTaskQueueManagerMaster(
 		return fmt.Errorf("failed to initialize Redis: %w", err)
 	}
 
+	// Clean up ghost instance resources from previous run
+	tm.cleanupGhostInstance()
+
 	// Initialize stop channels
 	tm.heartbeatStop = make(chan struct{})
 	tm.lockRenewalStop = make(chan struct{})
@@ -1367,8 +2101,27 @@ func InitTaskQueueManagerMaster(
 		// Start lock renewal goroutine
 		go tm.renewMasterLock()
 
-		// TODO Phase 2: Publish providers/servers config to Redis
-		// TODO Phase 2: Start Pub/Sub publisher
+		// Publish providers/servers config to Redis
+		if err := tm.publishConfig(providers, servers); err != nil {
+			return fmt.Errorf("failed to publish config: %w", err)
+		}
+
+		// Publish server slot limits to Redis for distributed coordination
+		if tm.slotCoordinator != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			for serverURL, semaphore := range tm.serverConcurrencyMap {
+				maxConcurrency := cap(semaphore)
+				if err := tm.slotCoordinator.SetServerMaxConcurrency(ctx, serverURL, maxConcurrency); err != nil {
+					cancel()
+					return fmt.Errorf("failed to publish slot limits: %w", err)
+				}
+			}
+			cancel()
+			logger.Info().
+				Str("instance", tm.instanceName).
+				Int("serversPublished", len(tm.serverConcurrencyMap)).
+				Msg("[tms|distributed] Published server slot limits to Redis")
+		}
 
 		// Start heartbeat
 		go tm.startHeartbeat()
@@ -1395,10 +2148,12 @@ func InitTaskQueueManagerMaster(
 	return nil
 }
 
-// InitTaskQueueSlave creates and starts a slave instance that pulls config from Redis
+// InitTaskQueueSlave creates and starts a slave instance with optional config from Redis
 func InitTaskQueueSlave(
 	cfg ConfigOptions,
 	logger *zerolog.Logger,
+	providers *[]IProvider,
+	servers map[string][]string,
 	tasks []ITask,
 	getTimeout func(string, string) time.Duration,
 ) error {
@@ -1407,25 +2162,105 @@ func InitTaskQueueSlave(
 
 	logger.Info().Msg("[tms|distributed] Slave initialization starting")
 
-	// TODO Phase 2: Pull providers/servers from Redis
-	// For now, create empty task manager that will fail gracefully
-	var emptyProviders []IProvider
-	emptyServers := make(map[string][]string)
+	var finalProviders *[]IProvider
+	var finalServers map[string][]string
 
-	tm := NewTaskManagerSimple(&emptyProviders, emptyServers, logger, getTimeout)
+	// Try to load config from Redis (optional - for centralized deployment control)
+	tempProviders := []IProvider{}
+	tm := NewTaskManagerSimple(&tempProviders, make(map[string][]string), logger, getTimeout)
 
-	// Initialize Redis connection
 	if err := tm.initRedisClient(&cfg); err != nil {
 		return fmt.Errorf("failed to initialize Redis: %w", err)
 	}
 
-	// Initialize stop channels
+	useMasterConfig := false
+	if tm.redisClient != nil {
+		// Try loading Master config (non-blocking, fails gracefully)
+		config, err := tm.loadConfigFromRedis()
+		if err == nil {
+			logger.Info().
+				Str("instance", tm.instanceName).
+				Int64("version", config.Version).
+				Msg("[tms|distributed] Loaded Master config - will match providers")
+
+			// Build local provider map
+			localProviderMap := make(map[string]IProvider)
+			for _, provider := range *providers {
+				localProviderMap[provider.Name()] = provider
+			}
+
+			// Match providers with Master's config
+			var matchedProviders []IProvider
+			matchedServers := make(map[string][]string)
+
+			for _, providerConfig := range config.Providers {
+				if localProvider, exists := localProviderMap[providerConfig.Name]; exists {
+					matchedProviders = append(matchedProviders, localProvider)
+					matchedServers[providerConfig.Name] = config.Servers[providerConfig.Name]
+					logger.Info().
+						Str("provider", providerConfig.Name).
+						Int("servers", len(config.Servers[providerConfig.Name])).
+						Msg("[tms|distributed] Matched provider")
+				}
+			}
+
+			if len(matchedProviders) > 0 {
+				finalProviders = &matchedProviders
+				finalServers = matchedServers
+				useMasterConfig = true
+
+				// Track Master-controlled servers
+				if config.ServerLimits != nil && len(config.ServerLimits) > 0 {
+					if tm.masterControlledServers == nil {
+						tm.masterControlledServers = make(map[string]bool)
+					}
+					for serverURL := range config.ServerLimits {
+						tm.masterControlledServers[serverURL] = true
+					}
+					logger.Info().
+						Str("instance", tm.instanceName).
+						Int("masterServers", len(config.ServerLimits)).
+						Msg("[tms|distributed] Tracked Master-controlled servers")
+				}
+			}
+		} else {
+			logger.Warn().
+				Err(err).
+				Msg("[tms|distributed] No Master config found - using local config")
+		}
+	}
+
+	// Fallback: use local config if Master config not available
+	if !useMasterConfig {
+		finalProviders = providers
+		finalServers = servers
+		logger.Info().Msg("[tms|distributed] Using local provider/server config")
+	}
+
+	// Preserve masterControlledServers for the new TM
+	masterControlledServers := tm.masterControlledServers
+
+	// Create task manager with final config
+	tm = NewTaskManagerSimple(finalProviders, finalServers, logger, getTimeout)
+
+	// Restore masterControlledServers
+	if masterControlledServers != nil {
+		tm.masterControlledServers = masterControlledServers
+	}
+
+	// Re-initialize Redis (we need the client in the new instance)
+	if err := tm.initRedisClient(&cfg); err != nil {
+		return fmt.Errorf("failed to re-initialize Redis: %w", err)
+	}
+
+	// Clean up ghost instance resources from previous run
+	tm.cleanupGhostInstance()
+
 	tm.heartbeatStop = make(chan struct{})
 
 	if tm.redisClient != nil {
-		// TODO Phase 2: Load config from Redis with retry logic
-		// TODO Phase 2: Validate config before using
-		// TODO Phase 2: Subscribe to Pub/Sub for config updates
+		// Subscribe to config updates
+		go tm.subscribeConfigUpdates()
 
 		// Start heartbeat
 		go tm.startHeartbeat()
@@ -1443,7 +2278,8 @@ func InitTaskQueueSlave(
 	logger.Info().
 		Str("instance", tm.instanceName).
 		Bool("isMaster", tm.isMaster).
-		Msg("[tms|distributed] Slave started (Phase 2 TODO: config loading)")
+		Int("providers", len(*finalProviders)).
+		Msg("[tms|distributed] Slave started with matched providers")
 	taskManagerCond.Broadcast()
 
 	// Requeue uncompleted tasks
