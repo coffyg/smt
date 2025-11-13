@@ -1005,32 +1005,40 @@ func InitTaskQueueManager(
 
 // RequeueTaskIfNeeded re-injects tasks that were incomplete
 func RequeueTaskIfNeeded(logger *zerolog.Logger, tasks []ITask) {
-	count, _ := TaskQueueManagerInstance.AddTasks(tasks)
+	tm := GetTaskQueueManagerInstance()
+	if tm == nil {
+		logger.Warn().Msg("[tms] Cannot requeue tasks - manager not initialized")
+		return
+	}
+	count, _ := tm.AddTasks(tasks)
 	logger.Info().Msgf("[tms] Requeued %d. (%d tasks in queue)", count, len(tasks))
 }
 
 // AddTask is the global helper for adding tasks
 func AddTask(task ITask, logger *zerolog.Logger) {
-	// Fast path: check if manager exists without lock
-	tm := (*TaskManagerSimple)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&TaskQueueManagerInstance))))
+	tm := GetTaskQueueManagerInstance()
 	if tm == nil {
 		return
 	}
-	
+
 	if tm.HasShutdownRequest() {
 		return
 	}
-	
+
 	// Direct add without retries for duplicates
 	if !tm.AddTask(task) {
 		logger.Debug().Str("taskID", task.GetID()).Msg("[tms|add-task] Task not added (duplicate)")
 	}
 }
 
+// GetTaskQueueManagerInstance returns the global instance using atomic load
+func GetTaskQueueManagerInstance() *TaskManagerSimple {
+	return (*TaskManagerSimple)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&TaskQueueManagerInstance))))
+}
+
 // DelTask is the global helper for deleting/cancelling tasks
 func DelTask(taskID string, interruptFn func(task ITask, server string) error, logger *zerolog.Logger) DelTaskResult {
-	// Fast path: check if manager exists without lock
-	tm := (*TaskManagerSimple)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&TaskQueueManagerInstance))))
+	tm := GetTaskQueueManagerInstance()
 	if tm == nil {
 		return DelTaskErrorNotRunning
 	}

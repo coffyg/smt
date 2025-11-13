@@ -340,16 +340,17 @@ func TestDelTaskNotFound(t *testing.T) {
 // TestDelTaskGlobal tests the global DelTask function
 func TestDelTaskGlobal(t *testing.T) {
 	logger := zerolog.Nop()
-	
+
 	provider := &MockProvider{name: "test"}
 	providers := []IProvider{provider}
 	servers := map[string][]string{"test": {"server1"}}
-	
+
 	// Initialize global task manager
 	InitTaskQueueManager(&logger, &providers, []ITask{}, servers, func(string, string) time.Duration {
 		return 30 * time.Second
 	})
-	defer TaskQueueManagerInstance.Shutdown()
+	tm := GetTaskQueueManagerInstance()
+	defer tm.Shutdown()
 
 	// Create and add task
 	task := &MockTask{
