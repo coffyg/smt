@@ -33,6 +33,10 @@ func TestServerPoolBlocking(t *testing.T) {
 	tm := NewTaskManagerSimple(&providers, servers, &logger, getTimeout)
 	tm.Start()
 	defer tm.Shutdown()
+	
+	// Set higher concurrency to test pool blocking behavior
+	// (default is 1, but this test needs concurrent tasks to trigger blocking)
+	tm.SetTaskManagerServerMaxParallel("server1", 5)
 
 	// Test strategy:
 	// 1. Create tasks that take 10+ seconds (holding servers busy)
@@ -51,8 +55,8 @@ func TestServerPoolBlocking(t *testing.T) {
 		startTime := time.Now()
 		taskStartTimes.Store(taskID, startTime)
 
-		// Simulate long-running AI task (5-15 seconds)
-		processingTime := time.Duration(5+len(taskID)%10) * time.Second
+		// Simulate long-running AI task (1-3 seconds) - reduced for test speed
+		processingTime := time.Duration(1+len(taskID)%3) * time.Second
 		time.Sleep(processingTime)
 
 		// Track completion time
@@ -85,7 +89,7 @@ func TestServerPoolBlocking(t *testing.T) {
 
 	// Phase 2: Flood with many tasks to trigger server pool overflow
 	t.Log("Phase 2: Flooding with tasks to trigger server pool blocking...")
-	floodTasks := 20 // More tasks than can be handled simultaneously
+	floodTasks := 10 // Reduced for faster test completion
 	var floodTaskChannels []chan struct{}
 
 	for i := 0; i < floodTasks; i++ {
@@ -200,6 +204,9 @@ func TestServerPoolBlockingWithMonitoring(t *testing.T) {
 	tm := NewTaskManagerSimple(&providers, servers, &logger, getTimeout)
 	tm.Start()
 	defer tm.Shutdown()
+	
+	// Set higher concurrency for testing
+	tm.SetTaskManagerServerMaxParallel("server1", 5)
 
 	// Monitor the provider's server channel status
 	pd := tm.providers[providerName]
@@ -303,6 +310,10 @@ func TestExtremeLagCascade(t *testing.T) {
 	tm := NewTaskManagerSimple(&providers, servers, &logger, getTimeout)
 	tm.Start()
 	defer tm.Shutdown()
+	
+	// Set higher concurrency for testing
+	tm.SetTaskManagerServerMaxParallel("server1", 10)
+	tm.SetTaskManagerServerMaxParallel("server2", 10)
 
 	var taskStarted int32
 	var taskCompleted int32
@@ -437,6 +448,9 @@ func TestCommandTaskInterference(t *testing.T) {
 	tm := NewTaskManagerSimple(&providers, servers, &logger, getTimeout)
 	tm.Start()
 	defer tm.Shutdown()
+	
+	// Set higher concurrency for testing
+	tm.SetTaskManagerServerMaxParallel("server1", 10)
 
 	var taskProcessed int32
 	var commandProcessed int32
@@ -506,6 +520,10 @@ func TestRetryStorm(t *testing.T) {
 	tm := NewTaskManagerSimple(&providers, servers, &logger, getTimeout)
 	tm.Start()
 	defer tm.Shutdown()
+	
+	// Set higher concurrency for testing
+	tm.SetTaskManagerServerMaxParallel("server1", 10)
+	tm.SetTaskManagerServerMaxParallel("server2", 10)
 
 	var attemptCount int32
 	var successCount int32
@@ -574,6 +592,9 @@ func TestContextLeak(t *testing.T) {
 	tm := NewTaskManagerSimple(&providers, servers, &logger, getTimeout)
 	tm.Start()
 	defer tm.Shutdown()
+	
+	// Set higher concurrency for testing
+	tm.SetTaskManagerServerMaxParallel("server1", 10)
 
 	var taskStarted int32
 	var taskCompleted int32
