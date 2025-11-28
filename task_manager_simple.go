@@ -155,7 +155,8 @@ local acquired = tonumber(redis.call('GET', acquired_key) or "0")
 if acquired < max then
     redis.call('INCR', acquired_key)
     redis.call('HINCRBY', holders_key, instance_name, 1)
-    redis.call('EXPIRE', holders_key, 300)  -- 5 min TTL for cleanup
+    -- No TTL on holders - dead instance monitor handles cleanup
+    -- TTL caused ghost locks when tasks took >5min (holders expired but acquired stayed)
     return 1  -- Success
 end
 return 0  -- Limit reached
@@ -963,7 +964,90 @@ func (tm *TaskManagerSimple) monitorDeadInstances() {
 					tm.cleanupDeadInstance(instanceName)
 				}
 			}
+
+			// Cleanup ghost locks (acquired > 0 but holders hash empty/missing)
+			tm.cleanupGhostLocks()
 		}
+	}
+}
+
+// cleanupGhostLocks finds and releases slots where acquired > 0 but no holders exist
+// This can happen if holders hash expired (legacy TTL) or other edge cases
+func (tm *TaskManagerSimple) cleanupGhostLocks() {
+	if tm.redisClient == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Scan for all acquired keys
+	pattern := "smt:slots:*:acquired"
+	var cursor uint64
+	var ghostsCleared int
+
+	for {
+		keys, nextCursor, err := tm.redisClient.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			tm.logger.Error().
+				Err(err).
+				Msg("[tms|ghost-locks] Failed to scan for acquired keys")
+			break
+		}
+
+		for _, acquiredKey := range keys {
+			// Get acquired count
+			acquired, err := tm.redisClient.Get(ctx, acquiredKey).Int()
+			if err != nil || acquired <= 0 {
+				continue
+			}
+
+			// Extract server URL and check holders
+			// Key format: smt:slots:{serverURL}:acquired
+			serverURL := strings.TrimPrefix(acquiredKey, "smt:slots:")
+			serverURL = strings.TrimSuffix(serverURL, ":acquired")
+			holdersKey := fmt.Sprintf("smt:slots:%s:holders", serverURL)
+
+			// Check if holders hash exists and has entries
+			holdersCount, err := tm.redisClient.HLen(ctx, holdersKey).Result()
+			if err != nil {
+				continue
+			}
+
+			// Ghost lock: acquired > 0 but no holders
+			if holdersCount == 0 {
+				// Reset acquired to 0
+				err = tm.redisClient.Set(ctx, acquiredKey, 0, 0).Err()
+				if err != nil {
+					tm.logger.Error().
+						Err(err).
+						Str("server", serverURL).
+						Msg("[tms|ghost-locks] Failed to clear ghost lock")
+					continue
+				}
+
+				// Also clear waiting queue
+				waitingKey := fmt.Sprintf("smt:slots:%s:waiting", serverURL)
+				_ = tm.redisClient.Del(ctx, waitingKey).Err()
+
+				ghostsCleared++
+				tm.logger.Warn().
+					Str("server", serverURL).
+					Int("wasAcquired", acquired).
+					Msg("[tms|ghost-locks] Cleared ghost lock (acquired > 0 but no holders)")
+			}
+		}
+
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
+	}
+
+	if ghostsCleared > 0 {
+		tm.logger.Info().
+			Int("cleared", ghostsCleared).
+			Msg("[tms|ghost-locks] Ghost lock cleanup complete")
 	}
 }
 
