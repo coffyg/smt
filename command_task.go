@@ -1,6 +1,7 @@
 package smt
 
 import (
+	"context"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ type CommandTask struct {
 	completed    bool
 	providerName string
 	sequence     int64
+	ctx          *context.Context
 }
 
 var commandSequence int64 = 0
@@ -29,7 +31,7 @@ var commandSequence int64 = 0
 func NewCommandTask(providerName string, provider IProvider, commandFunc func(server string) error, priority int) *CommandTask {
 	// Atomically increment sequence for each new command
 	seq := atomic.AddInt64(&commandSequence, 1) - 1
-	
+
 	return &CommandTask{
 		id:           uuid.New().String(),
 		commandFunc:  commandFunc,
@@ -41,6 +43,12 @@ func NewCommandTask(providerName string, provider IProvider, commandFunc func(se
 		providerName: providerName,
 		sequence:     seq,
 	}
+}
+func (ct *CommandTask) GetCtx() *context.Context {
+	return ct.ctx
+}
+func (ct *CommandTask) SetCtx(ctx context.Context) {
+	ct.ctx = &ctx
 }
 
 // MarkAsSuccess implements ITask
@@ -127,13 +135,13 @@ func (ct *CommandTask) OnStart() {
 
 // CommandProvider wraps command execution to implement IProvider interface
 type CommandProvider struct {
-	name        string
+	name string
 }
 
 // NewCommandProvider creates a new CommandProvider
 func NewCommandProvider(name string) *CommandProvider {
 	return &CommandProvider{
-		name:         name,
+		name: name,
 	}
 }
 

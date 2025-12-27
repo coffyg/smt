@@ -797,22 +797,29 @@ type MockTaskDistributed struct {
 	succeeded bool
 	failed    bool
 	mu        sync.Mutex
+	ctx       *context.Context
 }
 
-func (m *MockTaskDistributed) GetID() string                      { return m.id }
-func (m *MockTaskDistributed) GetProvider() IProvider             { return m.provider }
-func (m *MockTaskDistributed) GetPriority() int                   { return m.priority }
-func (m *MockTaskDistributed) GetMaxRetries() int                 { return 2 }
-func (m *MockTaskDistributed) GetRetries() int                    { return 0 }
-func (m *MockTaskDistributed) GetCreatedAt() time.Time            { return time.Now() }
-func (m *MockTaskDistributed) GetTaskGroup() ITaskGroup           { return nil }
-func (m *MockTaskDistributed) UpdateRetries(int) error            { return nil }
-func (m *MockTaskDistributed) GetTimeout() time.Duration          { return 5 * time.Second }
-func (m *MockTaskDistributed) UpdateLastError(string) error       { return nil }
-func (m *MockTaskDistributed) GetCallbackName() string            { return "" }
-func (m *MockTaskDistributed) OnComplete()                        {}
-func (m *MockTaskDistributed) OnStart()                           {}
-func (m *MockTaskDistributed) IsCompleted() bool                  { return atomic.LoadInt32(&m.completed) == 1 }
+func (ct *MockTaskDistributed) GetCtx() *context.Context {
+	return ct.ctx
+}
+func (ct *MockTaskDistributed) SetCtx(ctx context.Context) {
+	ct.ctx = &ctx
+}
+func (m *MockTaskDistributed) GetID() string                { return m.id }
+func (m *MockTaskDistributed) GetProvider() IProvider       { return m.provider }
+func (m *MockTaskDistributed) GetPriority() int             { return m.priority }
+func (m *MockTaskDistributed) GetMaxRetries() int           { return 2 }
+func (m *MockTaskDistributed) GetRetries() int              { return 0 }
+func (m *MockTaskDistributed) GetCreatedAt() time.Time      { return time.Now() }
+func (m *MockTaskDistributed) GetTaskGroup() ITaskGroup     { return nil }
+func (m *MockTaskDistributed) UpdateRetries(int) error      { return nil }
+func (m *MockTaskDistributed) GetTimeout() time.Duration    { return 5 * time.Second }
+func (m *MockTaskDistributed) UpdateLastError(string) error { return nil }
+func (m *MockTaskDistributed) GetCallbackName() string      { return "" }
+func (m *MockTaskDistributed) OnComplete()                  {}
+func (m *MockTaskDistributed) OnStart()                     {}
+func (m *MockTaskDistributed) IsCompleted() bool            { return atomic.LoadInt32(&m.completed) == 1 }
 
 func (m *MockTaskDistributed) MarkAsSuccess(t int64) {
 	m.mu.Lock()

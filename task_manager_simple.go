@@ -2191,6 +2191,7 @@ func (tm *TaskManagerSimple) HandleWithTimeout(
 	ctx = context.WithValue(ctx, serverNameKey, server)
 	ctx, cancel := context.WithTimeout(ctx, maxTimeout)
 	defer cancel()
+	task.SetCtx(ctx)
 
 	done := make(chan error, 1)
 	startTime := time.Now()

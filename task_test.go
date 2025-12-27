@@ -1,6 +1,7 @@
 package smt
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -27,8 +28,15 @@ type MockTask struct {
 	failedTime     int64
 	done           chan struct{}
 	doneOnce       sync.Once
+	ctx            *context.Context
 }
 
+func (ct *MockTask) GetCtx() *context.Context {
+	return ct.ctx
+}
+func (ct *MockTask) SetCtx(ctx context.Context) {
+	ct.ctx = &ctx
+}
 func (t *MockTask) MarkAsSuccess(time int64) {
 	t.success = true
 	t.successTime = time

@@ -1,6 +1,7 @@
 package smt
 
 import (
+	"context"
 	"time"
 )
 
@@ -21,6 +22,8 @@ type ITask interface {
 	GetCallbackName() string
 	OnComplete()
 	OnStart()
+	GetCtx() *context.Context
+	SetCtx(ctx context.Context)
 }
 
 type ITaskGroup interface {
