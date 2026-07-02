@@ -204,7 +204,7 @@ func TestMasterSlaveSlotContention(t *testing.T) {
 	slaveTM.heartbeatStop = make(chan struct{})
 
 	if slaveTM.redisClient != nil {
-		go slaveTM.subscribeConfigUpdates()
+		slaveTM.subscribeConfigUpdates()
 		go slaveTM.startHeartbeat()
 		go slaveTM.monitorDeadInstances()
 	}
@@ -462,7 +462,7 @@ func TestDistributedMasterSlave(t *testing.T) {
 	slaveTM.heartbeatStop = make(chan struct{})
 
 	if slaveTM.redisClient != nil {
-		go slaveTM.subscribeConfigUpdates()
+		slaveTM.subscribeConfigUpdates()
 		go slaveTM.startHeartbeat()
 		go slaveTM.monitorDeadInstances()
 	}
@@ -628,7 +628,7 @@ func TestDistributedMasterTwoSlaves(t *testing.T) {
 
 	slave1TM.heartbeatStop = make(chan struct{})
 	if slave1TM.redisClient != nil {
-		go slave1TM.subscribeConfigUpdates()
+		slave1TM.subscribeConfigUpdates()
 		go slave1TM.startHeartbeat()
 		go slave1TM.monitorDeadInstances()
 	}
@@ -651,7 +651,7 @@ func TestDistributedMasterTwoSlaves(t *testing.T) {
 
 	slave2TM.heartbeatStop = make(chan struct{})
 	if slave2TM.redisClient != nil {
-		go slave2TM.subscribeConfigUpdates()
+		slave2TM.subscribeConfigUpdates()
 		go slave2TM.startHeartbeat()
 		go slave2TM.monitorDeadInstances()
 	}
@@ -1202,7 +1202,7 @@ func TestSlaveIgnoresMasterServers(t *testing.T) {
 			}
 		}
 
-		go slaveTM.subscribeConfigUpdates()
+		slaveTM.subscribeConfigUpdates()
 		go slaveTM.startHeartbeat()
 	}
 
@@ -1334,7 +1334,7 @@ func TestConfigHotReload(t *testing.T) {
 	slaveTM.heartbeatStop = make(chan struct{})
 
 	if slaveTM.redisClient != nil {
-		go slaveTM.subscribeConfigUpdates()
+		slaveTM.subscribeConfigUpdates()
 		go slaveTM.startHeartbeat()
 	}
 

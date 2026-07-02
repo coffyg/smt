@@ -13,23 +13,66 @@ import (
 // TestDelTaskQueued tests removing a task from the queue before it starts
 func TestDelTaskQueued(t *testing.T) {
 	logger := zerolog.Nop()
-	
-	// Create test provider and server
-	provider := &MockProvider{name: "test"}
+
+	// A blocker task pins the single server so the target task deterministically
+	// stays in the queue (previously this test raced the dispatcher and relied on
+	// DelTask being called before near-instant task pickup).
+	blockerStarted := make(chan struct{}, 1)
+	blockerRelease := make(chan struct{})
+
+	provider := &MockProvider{
+		name: "test",
+		handleFunc: func(task ITask, server string) error {
+			if task.(*MockTask).id == "blocker" {
+				blockerStarted <- struct{}{}
+				<-blockerRelease
+			}
+			return nil
+		},
+	}
 	providers := []IProvider{provider}
 	servers := map[string][]string{"test": {"server1"}}
-	
+
 	tm := NewTaskManagerSimple(&providers, servers, &logger, func(string, string) time.Duration {
 		return 30 * time.Second
 	})
 	tm.Start()
 	defer tm.Shutdown()
+	// LIFO: release the blocker BEFORE Shutdown waits on in-flight tasks
+	defer close(blockerRelease)
 
-	// Create a task but don't let it execute (no goroutines processing yet)
+	blocker := &MockTask{id: "blocker", provider: provider, priority: 1, createdAt: time.Now()}
+	if !tm.AddTask(blocker) {
+		t.Fatal("Failed to add blocker task")
+	}
+	<-blockerStarted // server is now occupied
+
+	// The dispatcher pops the NEXT task and holds it while waiting for a free
+	// server — a popped task is not in the heap and thus invisible to DelTask.
+	// A high-priority decoy occupies the dispatcher's hand so the (lower-priority)
+	// target task provably remains in the heap.
+	decoy := &MockTask{id: "decoy", provider: provider, priority: 10, createdAt: time.Now()}
+	if !tm.AddTask(decoy) {
+		t.Fatal("Failed to add decoy task")
+	}
+
+	// Wait until the dispatcher has taken the decoy out of the heap (taskCount
+	// drops at pop) so the target's queue residency AND the final count are both
+	// deterministic.
+	pdEarly := tm.providers["test"]
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt32(&pdEarly.taskCount) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("dispatcher never picked up the decoy")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Create the target task: lower priority, guaranteed to stay queued
 	task := &MockTask{
-		id:       uuid.New().String(),
-		provider: provider,
-		priority: 1,
+		id:        uuid.New().String(),
+		provider:  provider,
+		priority:  1,
 		createdAt: time.Now(),
 	}
 
@@ -92,11 +135,11 @@ func TestDelTaskQueued(t *testing.T) {
 // TestDelTaskRunning tests interrupting a running task
 func TestDelTaskRunning(t *testing.T) {
 	logger := zerolog.Nop()
-	
+
 	// Synchronization to ensure Handle() has actually been called
 	handleStarted := make(chan string, 1) // Will receive the server name when Handle starts
-	handleContinue := make(chan struct{})  // Will signal Handle to continue
-	
+	handleContinue := make(chan struct{}) // Will signal Handle to continue
+
 	// Create test provider that blocks execution and signals when Handle starts
 	provider := &MockProvider{
 		name: "test",
@@ -110,7 +153,7 @@ func TestDelTaskRunning(t *testing.T) {
 	}
 	providers := []IProvider{provider}
 	servers := map[string][]string{"test": {"test-server-123"}}
-	
+
 	tm := NewTaskManagerSimple(&providers, servers, &logger, func(string, string) time.Duration {
 		return 30 * time.Second
 	})
@@ -119,9 +162,9 @@ func TestDelTaskRunning(t *testing.T) {
 
 	// Create task
 	task := &MockTask{
-		id:       uuid.New().String(),
-		provider: provider,
-		priority: 1,
+		id:        uuid.New().String(),
+		provider:  provider,
+		priority:  1,
 		createdAt: time.Now(),
 	}
 
@@ -144,11 +187,11 @@ func TestDelTaskRunning(t *testing.T) {
 	tm.runningTasksMu.RLock()
 	runningInfo, isRunning := tm.runningTasks[task.GetID()]
 	tm.runningTasksMu.RUnlock()
-	
+
 	if !isRunning {
 		t.Fatal("Task should be running")
 	}
-	
+
 	if runningInfo.server != actualServer {
 		t.Fatalf("Expected running task server '%s', got '%s'", actualServer, runningInfo.server)
 	}
@@ -159,7 +202,7 @@ func TestDelTaskRunning(t *testing.T) {
 	var serverReceived string
 	var wg sync.WaitGroup
 	wg.Add(1)
-	
+
 	interruptFn := func(task ITask, server string) error {
 		defer wg.Done()
 		interruptCalled = true
@@ -183,16 +226,16 @@ func TestDelTaskRunning(t *testing.T) {
 	if !interruptCalled {
 		t.Error("Interrupt function should have been called")
 	}
-	
+
 	// This is the critical test - server must match the actual server from Handle
 	if serverReceived != actualServer {
 		t.Errorf("Expected server '%s' (from Handle), got '%s'", actualServer, serverReceived)
 	}
-	
+
 	if serverReceived != "test-server-123" {
 		t.Errorf("Expected specific server 'test-server-123', got '%s'", serverReceived)
 	}
-	
+
 	if taskReceived == nil {
 		t.Error("Task should have been passed to interrupt function")
 	} else if taskReceived.GetID() != task.GetID() {
@@ -201,7 +244,7 @@ func TestDelTaskRunning(t *testing.T) {
 
 	// Let Handle finish
 	close(handleContinue)
-	
+
 	// Wait a bit for cleanup
 	time.Sleep(50 * time.Millisecond)
 }
@@ -209,18 +252,18 @@ func TestDelTaskRunning(t *testing.T) {
 // TestDelTaskLongRunning tests interrupting a definitely running long task
 func TestDelTaskLongRunning(t *testing.T) {
 	logger := zerolog.Nop()
-	
+
 	// Use channels to coordinate the test precisely
-	handleStarted := make(chan string, 1)  // Handle sends server name when it starts
+	handleStarted := make(chan string, 1)       // Handle sends server name when it starts
 	interruptReceived := make(chan struct{}, 1) // Test signals when interrupt is done
-	handleShouldExit := make(chan struct{})  // Signals Handle to exit
-	
+	handleShouldExit := make(chan struct{})     // Signals Handle to exit
+
 	provider := &MockProvider{
 		name: "longtest",
 		handleFunc: func(task ITask, server string) error {
 			// Immediately signal we've started with the server name
 			handleStarted <- server
-			
+
 			// Simulate long-running work that can be interrupted
 			for {
 				select {
@@ -232,10 +275,10 @@ func TestDelTaskLongRunning(t *testing.T) {
 			}
 		},
 	}
-	
+
 	providers := []IProvider{provider}
 	servers := map[string][]string{"longtest": {"long-server-456"}}
-	
+
 	tm := NewTaskManagerSimple(&providers, servers, &logger, func(string, string) time.Duration {
 		return 30 * time.Second
 	})
@@ -243,9 +286,9 @@ func TestDelTaskLongRunning(t *testing.T) {
 	defer tm.Shutdown()
 
 	task := &MockTask{
-		id:       uuid.New().String(),
-		provider: provider,
-		priority: 1,
+		id:        uuid.New().String(),
+		provider:  provider,
+		priority:  1,
 		createdAt: time.Now(),
 	}
 
@@ -279,7 +322,7 @@ func TestDelTaskLongRunning(t *testing.T) {
 
 	// Interrupt the definitely-running task
 	result := tm.DelTask(task.GetID(), interruptFn)
-	
+
 	// Wait for interrupt to be processed
 	select {
 	case <-interruptReceived:
@@ -313,11 +356,11 @@ func TestDelTaskLongRunning(t *testing.T) {
 // TestDelTaskNotFound tests deleting a non-existent task
 func TestDelTaskNotFound(t *testing.T) {
 	logger := zerolog.Nop()
-	
+
 	provider := &MockProvider{name: "test"}
 	providers := []IProvider{provider}
 	servers := map[string][]string{"test": {"server1"}}
-	
+
 	tm := NewTaskManagerSimple(&providers, servers, &logger, func(string, string) time.Duration {
 		return 30 * time.Second
 	})
@@ -341,7 +384,21 @@ func TestDelTaskNotFound(t *testing.T) {
 func TestDelTaskGlobal(t *testing.T) {
 	logger := zerolog.Nop()
 
-	provider := &MockProvider{name: "test"}
+	// Deterministic queue residency: blocker occupies the server, high-priority
+	// decoy occupies the dispatcher's hand (see TestDelTaskQueued).
+	blockerStarted := make(chan struct{}, 1)
+	blockerRelease := make(chan struct{})
+
+	provider := &MockProvider{
+		name: "test",
+		handleFunc: func(task ITask, server string) error {
+			if task.(*MockTask).id == "blocker" {
+				blockerStarted <- struct{}{}
+				<-blockerRelease
+			}
+			return nil
+		},
+	}
 	providers := []IProvider{provider}
 	servers := map[string][]string{"test": {"server1"}}
 
@@ -351,12 +408,21 @@ func TestDelTaskGlobal(t *testing.T) {
 	})
 	tm := GetTaskQueueManagerInstance()
 	defer tm.Shutdown()
+	// LIFO: release the blocker BEFORE Shutdown waits on in-flight tasks
+	defer close(blockerRelease)
 
-	// Create and add task
+	blocker := &MockTask{id: "blocker", provider: provider, priority: 1, createdAt: time.Now()}
+	AddTask(blocker, &logger)
+	<-blockerStarted
+
+	decoy := &MockTask{id: "decoy", provider: provider, priority: 10, createdAt: time.Now()}
+	AddTask(decoy, &logger)
+
+	// Create and add the target task (stays queued behind blocker + decoy)
 	task := &MockTask{
-		id:       uuid.New().String(),
-		provider: provider,
-		priority: 1,
+		id:        uuid.New().String(),
+		provider:  provider,
+		priority:  1,
 		createdAt: time.Now(),
 	}
 
@@ -394,4 +460,3 @@ func TestDelTaskGlobal(t *testing.T) {
 		t.Errorf("Expected task ID '%s', got '%s'", task.GetID(), taskReceived.GetID())
 	}
 }
-

@@ -363,9 +363,11 @@ func TestTaskManagerShutdownWithParallelismLimit(t *testing.T) {
 	// Initiate shutdown
 	tm.Shutdown()
 
-	// Signal tasks to complete
-	close(task1.done)
-	close(task2.done)
+	// Signal tasks to complete. Use doneOnce: a task whose re-queue was refused by
+	// the shutdown is now marked failed + completed by the manager (instead of being
+	// silently dropped), which already closed its done channel via OnComplete.
+	task1.doneOnce.Do(func() { close(task1.done) })
+	task2.doneOnce.Do(func() { close(task2.done) })
 
 	// Verify that the TaskManager has stopped
 	if tm.IsRunning() {

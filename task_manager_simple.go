@@ -69,6 +69,7 @@ type RunningTaskInfo struct {
 	task         ITask
 	interruptFn  func(task ITask, server string) error
 	cancelCh     chan struct{}
+	cancelled    bool // guards cancelCh against double-close (protected by runningTasksMu)
 	providerName string
 	server       string
 }
@@ -236,9 +237,13 @@ func (rsc *RedisSlotCoordinator) AcquireSlot(ctx context.Context, serverURL stri
 		return true
 	}
 
-	// result == 0 means limit reached - add to waiting set
+	// result == 0 means limit reached - add to waiting set.
+	// ZAddNX keeps the FIRST rejection timestamp: re-adding with a fresh score on
+	// every retry (the old behavior) meant a constantly-retrying instance reset its
+	// own wait-age each attempt, so it never appeared starved and other instances
+	// never yielded to it — defeating the fairness valve entirely.
 	now := float64(time.Now().UnixNano()) / 1e9
-	_ = rsc.client.ZAdd(ctx, waitingKey, redis.Z{
+	_ = rsc.client.ZAddNX(ctx, waitingKey, redis.Z{
 		Score:  now,
 		Member: rsc.instanceName,
 	}).Err()
@@ -614,16 +619,27 @@ func (tm *TaskManagerSimple) loadConfigFromRedis() (*SerializedConfig, error) {
 	return config, nil
 }
 
-// subscribeConfigUpdates listens for config changes via Pub/Sub
+// subscribeConfigUpdates creates the Pub/Sub subscription for config changes and
+// starts the listener goroutine. It MUST be called from the init goroutine (before
+// any concurrent Shutdown is possible): tm.configPubSub is written here exactly once
+// and only read afterwards — writing it inside the listener goroutine raced with
+// Shutdown's read (caught by -race in TestSlaveIgnoresMasterServers).
 func (tm *TaskManagerSimple) subscribeConfigUpdates() {
 	if tm.redisClient == nil {
 		return
 	}
 
-	ctx := context.Background()
-	pubsub := tm.redisClient.Subscribe(ctx, "smt:config:updates")
-	tm.configPubSub = pubsub // Store for shutdown
+	pubsub := tm.redisClient.Subscribe(context.Background(), "smt:config:updates")
+	tm.configPubSub = pubsub // Store for shutdown (single write, init goroutine)
+
+	go tm.listenConfigUpdates(pubsub)
+}
+
+// listenConfigUpdates consumes config-update notifications until shutdown.
+func (tm *TaskManagerSimple) listenConfigUpdates(pubsub *redis.PubSub) {
 	defer pubsub.Close()
+
+	ctx := context.Background()
 
 	tm.logger.Info().
 		Str("instance", tm.instanceName).
@@ -823,6 +839,25 @@ func (tm *TaskManagerSimple) releaseMasterLock() {
 	}
 }
 
+// instanceRegistryKey is a persistent set of every instance name that has ever
+// sent a heartbeat. Dead-instance detection walks this set and treats a missing
+// heartbeat key as "dead" — the heartbeat keys themselves expire and therefore can
+// never be discovered by scanning once the instance is gone.
+const instanceRegistryKey = "smt:instances:registry"
+
+// sendHeartbeat writes the heartbeat key (TTL 30s) and keeps the instance
+// registered in the instance registry set.
+func (tm *TaskManagerSimple) sendHeartbeat(heartbeatKey string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	pipe := tm.redisClient.Pipeline()
+	pipe.Set(ctx, heartbeatKey, time.Now().Unix(), 30*time.Second)
+	pipe.SAdd(ctx, instanceRegistryKey, tm.instanceName)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
 // startHeartbeat runs as goroutine to periodically update instance heartbeat
 func (tm *TaskManagerSimple) startHeartbeat() {
 	if tm.redisClient == nil {
@@ -833,12 +868,8 @@ func (tm *TaskManagerSimple) startHeartbeat() {
 	defer ticker.Stop()
 
 	// Send initial heartbeat immediately
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	heartbeatKey := fmt.Sprintf("smt:instances:%s:heartbeat", tm.instanceName)
-	err := tm.redisClient.Set(ctx, heartbeatKey, time.Now().Unix(), 30*time.Second).Err()
-	cancel()
-
-	if err != nil {
+	if err := tm.sendHeartbeat(heartbeatKey); err != nil {
 		tm.logger.Error().
 			Err(err).
 			Str("instance", tm.instanceName).
@@ -854,11 +885,7 @@ func (tm *TaskManagerSimple) startHeartbeat() {
 		case <-tm.heartbeatStop:
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			err := tm.redisClient.Set(ctx, heartbeatKey, time.Now().Unix(), 30*time.Second).Err()
-			cancel()
-
-			if err != nil {
+			if err := tm.sendHeartbeat(heartbeatKey); err != nil {
 				tm.logger.Error().
 					Err(err).
 					Str("instance", tm.instanceName).
@@ -872,20 +899,21 @@ func (tm *TaskManagerSimple) startHeartbeat() {
 	}
 }
 
-// stopHeartbeat stops the heartbeat goroutine and removes heartbeat key
+// stopHeartbeat removes the heartbeat key and deregisters the instance.
+// Called from Shutdown after heartbeatStop is closed.
 func (tm *TaskManagerSimple) stopHeartbeat() {
 	if tm.redisClient == nil {
 		return
 	}
 
-	// heartbeatStop already closed in Shutdown()
-
-	// Remove heartbeat key
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
 	heartbeatKey := fmt.Sprintf("smt:instances:%s:heartbeat", tm.instanceName)
-	err := tm.redisClient.Del(ctx, heartbeatKey).Err()
+	pipe := tm.redisClient.Pipeline()
+	pipe.Del(ctx, heartbeatKey)
+	pipe.SRem(ctx, instanceRegistryKey, tm.instanceName)
+	_, err := pipe.Exec(ctx)
 	if err != nil {
 		tm.logger.Error().
 			Err(err).
@@ -894,7 +922,7 @@ func (tm *TaskManagerSimple) stopHeartbeat() {
 	} else {
 		tm.logger.Info().
 			Str("instance", tm.instanceName).
-			Msg("[tms|distributed] Removed heartbeat key")
+			Msg("[tms|distributed] Removed heartbeat key + registry entry")
 	}
 }
 
@@ -912,61 +940,54 @@ func (tm *TaskManagerSimple) monitorDeadInstances() {
 		case <-tm.shutdownCh:
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-
-			// Scan for all instance heartbeat keys
-			pattern := "smt:instances:*:heartbeat"
-			var cursor uint64
-			var deadInstances []string
-
-			for {
-				keys, nextCursor, err := tm.redisClient.Scan(ctx, cursor, pattern, 100).Result()
-				if err != nil {
-					tm.logger.Error().
-						Err(err).
-						Msg("[tms|distributed] Failed to scan for instance heartbeats")
-					break
-				}
-
-				// Check TTL for each key - if expired (TTL -2), instance is dead
-				for _, key := range keys {
-					ttl, err := tm.redisClient.TTL(ctx, key).Result()
-					if err != nil {
-						continue
-					}
-
-					// TTL -2 means key doesn't exist (expired)
-					// TTL -1 means key exists but has no expiry (shouldn't happen)
-					if ttl == -2*time.Second {
-						// Extract instance name from key: smt:instances:{name}:heartbeat
-						parts := strings.Split(key, ":")
-						if len(parts) >= 3 {
-							instanceName := parts[2]
-							deadInstances = append(deadInstances, instanceName)
-						}
-					}
-				}
-
-				cursor = nextCursor
-				if cursor == 0 {
-					break
-				}
-			}
-
-			cancel()
-
-			// Cleanup dead instances
-			for _, instanceName := range deadInstances {
-				if instanceName != tm.instanceName {
-					tm.logger.Warn().
-						Str("deadInstance", instanceName).
-						Msg("[tms|distributed] Detected dead instance, cleaning up")
-					tm.cleanupDeadInstance(instanceName)
-				}
-			}
+			tm.checkDeadInstancesOnce()
 
 			// Cleanup ghost locks (acquired > 0 but holders hash empty/missing)
 			tm.cleanupGhostLocks()
+		}
+	}
+}
+
+// checkDeadInstancesOnce performs one dead-instance detection pass.
+//
+// Detection walks the persistent instance registry set and treats a missing
+// heartbeat key as "instance is dead". (The previous implementation scanned
+// `smt:instances:*:heartbeat` and looked for expired TTLs — but expired keys are
+// gone and can never be returned by SCAN, so detection never fired and crashed
+// instances leaked their slots until a same-name restart cleaned them up.)
+func (tm *TaskManagerSimple) checkDeadInstancesOnce() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	registered, err := tm.redisClient.SMembers(ctx, instanceRegistryKey).Result()
+	if err != nil {
+		tm.logger.Error().
+			Err(err).
+			Msg("[tms|distributed] Failed to read instance registry")
+		return
+	}
+
+	for _, instanceName := range registered {
+		if instanceName == tm.instanceName {
+			continue
+		}
+
+		heartbeatKey := fmt.Sprintf("smt:instances:%s:heartbeat", instanceName)
+		exists, err := tm.redisClient.Exists(ctx, heartbeatKey).Result()
+		if err != nil {
+			continue
+		}
+
+		if exists == 0 {
+			// Registered but no live heartbeat → dead instance
+			tm.logger.Warn().
+				Str("deadInstance", instanceName).
+				Msg("[tms|distributed] Detected dead instance, cleaning up")
+			tm.cleanupDeadInstance(instanceName)
+
+			// Deregister so we don't re-clean it every tick; if it comes back
+			// alive it re-registers with its next heartbeat.
+			_ = tm.redisClient.SRem(ctx, instanceRegistryKey, instanceName).Err()
 		}
 	}
 }
@@ -1425,9 +1446,15 @@ func (tm *TaskManagerSimple) DelTask(taskID string, interruptFn func(task ITask,
 	// First, check if task is currently running
 	tm.runningTasksMu.Lock()
 	if runningTask, exists := tm.runningTasks[taskID]; exists {
-		// Task is currently running - set interrupt function and signal cancellation
+		// Task is currently running - set interrupt function and signal cancellation.
+		// The close is guarded so a second DelTask for the same running task is
+		// idempotent instead of panicking (close of closed channel) — which would
+		// leak runningTasksMu and freeze the whole manager.
 		runningTask.interruptFn = interruptFn
-		close(runningTask.cancelCh) // Signal the running task to cancel
+		if !runningTask.cancelled {
+			runningTask.cancelled = true
+			close(runningTask.cancelCh) // Signal the running task to cancel
+		}
 		task := runningTask.task
 		server := runningTask.server
 		tm.runningTasksMu.Unlock()
@@ -1585,9 +1612,6 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 		Str("provider", providerName).
 		Msg("[tms] providerDispatcher started")
 
-	const batchSize = 4
-	serverBatch := make([]string, 0, batchSize)
-
 	var isCommand bool
 	var command Command
 	var task ITask
@@ -1596,47 +1620,7 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 	var server string
 
 	for {
-		// If we have leftover servers in the local batch, try to use them
-		if len(serverBatch) > 0 {
-			server = serverBatch[0]
-			serverBatch = serverBatch[1:]
-
-			isCommand = false
-			command = Command{}
-			task = nil
-			hasWork = false
-
-			pd.taskQueueLock.Lock()
-			if pd.taskQueue.Len() > 0 {
-				taskWithPriority = heap.Pop(&pd.taskQueue).(*TaskWithPriority)
-				atomic.AddInt32(&pd.taskCount, -1)
-				task = taskWithPriority.task
-				hasWork = true
-			} else if pd.commandQueue.Len() > 0 {
-				command, _ = pd.commandQueue.Dequeue()
-				atomic.AddInt32(&pd.commandCount, -1)
-				isCommand = true
-				hasWork = true
-			} else {
-				// No tasks or commands; return the server
-				pd.taskQueueLock.Unlock()
-				pd.availableServers <- server
-				continue
-			}
-			pd.taskQueueLock.Unlock()
-
-			if hasWork {
-				tm.wg.Add(1)
-				if isCommand {
-					go tm.processCommand(command, providerName, server)
-				} else {
-					go tm.processTask(task, providerName, server)
-				}
-			}
-			continue
-		}
-
-		// Otherwise, wait for tasks/commands
+		// Wait for tasks/commands
 		isCommand = false
 		command = Command{}
 		taskWithPriority = nil
@@ -1728,7 +1712,6 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 				go tm.processTask(task, providerName, server)
 			}
 
-			// Skip server batching to reduce complexity
 		}
 	}
 }
@@ -1763,13 +1746,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 	var hasLimit bool
 	var usingRedis bool
 
-	// Normalize server URL for slot coordination
-	normalizedServer := server
-	if u, err := url.Parse(server); err == nil {
-		u.RawQuery = ""
-		u.Fragment = ""
-		normalizedServer = u.String()
-	}
+	// Normalize server URL once; both slot-coordination paths key on it
+	normalizedServer := normalizeServerURL(server)
 
 	if tm.slotCoordinator != nil {
 		// Distributed mode - use Redis coordination
@@ -1798,7 +1776,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			backoffDelay := tm.calculateConcurrencyBackoff(taskID)
 			time.Sleep(backoffDelay)
 
-			tm.AddTask(task)
+			tm.requeueOrFail(task, "redis slot limit")
 			return
 		}
 
@@ -1807,8 +1785,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			Str("taskID", taskID).
 			Msg("[tms|processTask] Acquired Redis slot")
 	} else {
-		// Local mode - use channel semaphores
-		semaphore, hasLimit = tm.getServerSemaphore(server)
+		// Local mode - use channel semaphores (URL already normalized above)
+		semaphore, hasLimit = tm.getServerSemaphoreNormalized(normalizedServer)
 		if hasLimit {
 			// Try to acquire non-blocking first
 			select {
@@ -1834,7 +1812,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 				backoffDelay := tm.calculateConcurrencyBackoff(taskID)
 				time.Sleep(backoffDelay)
 
-				tm.AddTask(task)
+				tm.requeueOrFail(task, "local slot limit")
 				return
 			}
 		}
@@ -1956,8 +1934,8 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 					Msg("[tms] retrying task")
 			}
 			task.UpdateRetries(retries + 1)
-			tm.delTaskInQueue(task) // remove so it can be re-added
-			tm.AddTask(task)        // This will re-store the provider mapping
+			tm.delTaskInQueue(task)              // remove so it can be re-added
+			tm.requeueOrFail(task, "task retry") // re-stores the provider mapping
 		}
 	} else {
 		// Success
@@ -1988,17 +1966,26 @@ func (tm *TaskManagerSimple) returnServerToPool(providerExists bool, pd *Provide
 	pd.availableServers <- server
 }
 
+// normalizeServerURL strips query string and fragment so every pool variation of an
+// endpoint ("https://foo?s=1", "https://foo?s=2") shares one concurrency key.
+func normalizeServerURL(server string) string {
+	if u, err := url.Parse(server); err == nil {
+		u.RawQuery = ""
+		u.Fragment = ""
+		return u.String()
+	}
+	return server
+}
+
 // getServerSemaphore checks if the server has a concurrency limit.
 // Always returns true now since we default to limit of 1.
 func (tm *TaskManagerSimple) getServerSemaphore(server string) (chan struct{}, bool) {
-	// Optional: parse out query, to unify concurrency for any query string
-	if u, err := url.Parse(server); err == nil {
-		// Remove query and fragment, so "https://foo?x=1" => "https://foo"
-		u.RawQuery = ""
-		u.Fragment = ""
-		server = u.String()
-	}
+	return tm.getServerSemaphoreNormalized(normalizeServerURL(server))
+}
 
+// getServerSemaphoreNormalized is getServerSemaphore for callers that already hold
+// the normalized URL (the task hot path normalizes once and reuses it).
+func (tm *TaskManagerSimple) getServerSemaphoreNormalized(server string) (chan struct{}, bool) {
 	tm.serverConcurrencyMu.RLock()
 
 	// Check if we have an exact match or prefix match
@@ -2085,6 +2072,38 @@ func (tm *TaskManagerSimple) cleanupTaskTracking(taskID string) {
 	tm.taskToProvider.Delete(taskID)
 }
 
+// requeueOrFail re-adds a task that must run again (concurrency rejection or retry).
+// Previously this was a bare AddTask whose failure was ignored: a shutdown starting
+// during the backoff sleep silently dropped the task — no MarkAsFailed, no
+// OnComplete — leaving upstream state stuck at "processing" forever.
+func (tm *TaskManagerSimple) requeueOrFail(task ITask, reason string) {
+	if tm.AddTask(task) {
+		return
+	}
+
+	taskID := task.GetID()
+
+	if tm.HasShutdownRequest() || !tm.IsRunning() {
+		err := fmt.Errorf("task '%s' could not be re-queued (%s): task manager shutting down", taskID, reason)
+		tm.logger.Warn().
+			Str("taskID", taskID).
+			Str("reason", reason).
+			Msg("[tms] Re-queue failed during shutdown; marking task as failed")
+		task.MarkAsFailed(0, err)
+		task.OnComplete()
+		tm.cleanupTaskTracking(taskID)
+		return
+	}
+
+	// AddTask returned false while running: a task with the same ID re-entered the
+	// queue concurrently (external re-submission won the race). The queued instance
+	// owns the lifecycle now — don't touch shared tracking, just drop this hand-off.
+	tm.logger.Warn().
+		Str("taskID", taskID).
+		Str("reason", reason).
+		Msg("[tms] Re-queue rejected (duplicate task ID already queued); yielding to queued instance")
+}
+
 // Shutdown signals and waits for all provider dispatchers
 func (tm *TaskManagerSimple) Shutdown() {
 	if !tm.IsRunning() {
@@ -2128,6 +2147,9 @@ func (tm *TaskManagerSimple) Shutdown() {
 		if tm.heartbeatStop != nil {
 			tm.logger.Debug().Str("instance", tm.instanceName).Msg("[tms] >>> Closing heartbeatStop")
 			close(tm.heartbeatStop)
+			// Remove heartbeat key + registry entry so a cleanly stopped instance
+			// doesn't look alive for another 30s (and is never flagged "dead")
+			tm.stopHeartbeat()
 		}
 
 		// Release master lock if we're the master
@@ -2452,6 +2474,12 @@ func InitTaskQueueSlave(
 	// Preserve masterControlledServers for the new TM
 	masterControlledServers := tm.masterControlledServers
 
+	// Close the temporary Redis client used for config loading — the real manager
+	// below opens its own (previously this connection leaked, one per slave boot)
+	if tm.redisClient != nil {
+		_ = tm.redisClient.Close()
+	}
+
 	// Create task manager with final config
 	tm = NewTaskManagerSimple(finalProviders, finalServers, logger, getTimeout)
 
@@ -2472,7 +2500,7 @@ func InitTaskQueueSlave(
 
 	if tm.redisClient != nil {
 		// Subscribe to config updates
-		go tm.subscribeConfigUpdates()
+		tm.subscribeConfigUpdates() // subscribes synchronously, spawns its own listener
 
 		// Start heartbeat
 		go tm.startHeartbeat()

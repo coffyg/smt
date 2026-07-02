@@ -1,6 +1,8 @@
 # Go SMT (Swift Multiplexing Tasker)
 
-SMT is a high-performance, concurrent task management system written in Go. It is designed to manage and execute a large number of tasks efficiently across a pool of workers, with fine-grained control over prioritization, concurrency, and error handling.
+SMT is a high-performance, concurrent task management system written in Go. It is designed to manage and execute a large number of tasks efficiently across a pool of workers, with fine-grained control over prioritization, concurrency, and error handling. It optionally coordinates per-server concurrency budgets across multiple processes through Redis (master/slave mode).
+
+**Full documentation lives in [`docs/`](docs/):** [Architecture](docs/ARCHITECTURE.md) · [API reference](docs/API.md) · [Distributed mode](docs/DISTRIBUTED.md) · [Operations](docs/OPERATIONS.md) · [Known issues](docs/KNOWN-ISSUES.md)
 
 ## Core Concepts
 
@@ -44,16 +46,14 @@ SMT uses a sophisticated dual-queue system for each provider to separate busines
 
 #### 1. Task Priority Queue (`TaskQueuePrio`)
 
-This is the primary queue for `ITask` objects. It is implemented as a **min-heap** based on priority.
+This is the primary queue for `ITask` objects. It is implemented as a **binary heap** ordered by priority.
 
 -   **Prioritization**: Higher integer values have higher priority.
--   **Fairness**: If two tasks have the same priority, the one that was added earlier is executed first (FIFO for equal priority).
+-   **Fairness**: If two tasks have the same priority, ordering approximates FIFO (heap-index tiebreak) but is not a strict guarantee.
 
-#### 2. Command Queue (`CommandQueue`)
+#### 2. Commands (`ExecuteCommand`)
 
-This is a standard, thread-safe **FIFO queue** implemented with an efficient, resizing ring buffer. It holds `Command` objects.
-
--   **Execution**: Commands are wrapped in a special `CommandTask` that gives them a negative priority, ensuring they are almost always processed before regular tasks in the main dispatch loop. This allows administrative actions to be handled swiftly.
+Administrative closures can be queued with `ExecuteCommand`. They are wrapped in a `CommandTask` with a **negative priority**, so they execute **after** all pending regular tasks (priority ≥ 0), in FIFO order among themselves. The separate `CommandQueue` ring buffer is a legacy path with no public producer — see `docs/ARCHITECTURE.md`.
 
 ### Concurrency and Backoff
 
