@@ -116,6 +116,13 @@ type ProviderData struct {
 	commandQueue   *CommandQueue
 	commandSet     map[uuid.UUID]struct{}
 	commandSetLock sync.Mutex
+
+	// Live server-pool updates (UpdateProviderServers). serverMembers is the
+	// CURRENT membership set; nil until the first update, which keeps the
+	// legacy return path byte-identical for managers that never update.
+	// The map behind the pointer is replaced wholesale, never mutated.
+	serverMembers   atomic.Pointer[map[string]struct{}]
+	serversUpdateMu sync.Mutex // serializes UpdateProviderServers per provider
 }
 
 // ProviderConfig holds serializable provider configuration for Redis
@@ -1242,8 +1249,11 @@ func NewTaskManagerSimple(
 			commandQueue:     NewCommandQueue(256), // Increased initial capacity to reduce resizing
 			commandSet:       make(map[uuid.UUID]struct{}),
 			commandSetLock:   sync.Mutex{},
-			servers:          serverList,
-			availableServers: make(chan string, len(serverList)*2), // Double buffer for re-queuing scenarios
+			servers: serverList,
+			// Double buffer for re-queuing scenarios; floor of 32 leaves
+			// headroom for UpdateProviderServers to grow a pool at runtime
+			// (the channel is never swapped — the dispatcher blocks on it).
+			availableServers: make(chan string, max(len(serverList)*2, 32)),
 		}
 
 		// Fill the channel with all servers
@@ -1961,6 +1971,17 @@ func (tm *TaskManagerSimple) HandleTask(task ITask, server string) error {
 func (tm *TaskManagerSimple) returnServerToPool(providerExists bool, pd *ProviderData, server string) {
 	if !providerExists {
 		return
+	}
+	// Live-updated pool (UpdateProviderServers): a server that left the fleet
+	// while this task/command was in flight must NOT re-enter the pool — its
+	// token dies here. nil (never updated) = exact legacy behavior.
+	if members := pd.serverMembers.Load(); members != nil {
+		if _, ok := (*members)[server]; !ok {
+			tm.logger.Debug().
+				Str("server", server).
+				Msg("[tms] Dropping returned server no longer in pool")
+			return
+		}
 	}
 	// Always block to ensure server is returned
 	pd.availableServers <- server
