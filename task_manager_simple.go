@@ -1781,8 +1781,13 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			// Re-queue without incrementing retry counter
 			tm.delTaskInQueue(task)
 
-			// Calculate exponential backoff
+			// Calculate exponential backoff — bounded: fail for real once the
+			// task has starved past MaxConcurrencySlotRetries total misses.
 			backoffDelay := tm.calculateConcurrencyBackoff(taskID)
+			if tm.concurrencySlotRetries(taskID) > MaxConcurrencySlotRetries {
+				tm.failAfterSlotStarvation(task, taskID, normalizedServer, started)
+				return
+			}
 			time.Sleep(backoffDelay)
 
 			tm.requeueOrFail(task, "redis slot limit")
@@ -1817,8 +1822,13 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 				// Re-queue without incrementing retry counter
 				tm.delTaskInQueue(task)
 
-				// Calculate exponential backoff
+				// Calculate exponential backoff — same starvation bound as the
+				// redis path: eventually fail so the caller's retry layer owns it.
 				backoffDelay := tm.calculateConcurrencyBackoff(taskID)
+				if tm.concurrencySlotRetries(taskID) > MaxConcurrencySlotRetries {
+					tm.failAfterSlotStarvation(task, taskID, normalizedServer, started)
+					return
+				}
 				time.Sleep(backoffDelay)
 
 				tm.requeueOrFail(task, "local slot limit")
@@ -2090,6 +2100,36 @@ func (tm *TaskManagerSimple) calculateConcurrencyBackoff(taskID string) time.Dur
 		Msg("[tms] Concurrency backoff calculated")
 
 	return finalDelay
+}
+
+// MaxConcurrencySlotRetries bounds how many times a task may consecutively miss
+// a concurrency slot before being failed for real (MarkAsFailed + OnComplete) so
+// the caller's own retry/failure layer takes over. At the 800ms-1.2s capped
+// backoff this is roughly 2-4 minutes of genuine trying. Before this bound a
+// task could requeue forever against a saturated server.
+var MaxConcurrencySlotRetries = 100
+
+// concurrencySlotRetries returns the current slot-miss count for a task.
+func (tm *TaskManagerSimple) concurrencySlotRetries(taskID string) int {
+	if v, _ := tm.concurrencyRetryMap.Load(taskID); v != nil {
+		return v.(int)
+	}
+	return 0
+}
+
+// failAfterSlotStarvation terminally fails a task that exceeded
+// MaxConcurrencySlotRetries. The server was already returned to the pool and no
+// slot is held at this point; the task was already removed from the queue set.
+func (tm *TaskManagerSimple) failAfterSlotStarvation(task ITask, taskID, server string, started time.Time) {
+	err := fmt.Errorf("task '%s' gave up on server '%s': no concurrency slot after %d attempts", taskID, server, MaxConcurrencySlotRetries)
+	tm.logger.Error().
+		Str("taskID", taskID).
+		Str("server", server).
+		Int("attempts", MaxConcurrencySlotRetries).
+		Msg("[tms|processTask] Slot starvation limit reached — failing task")
+	task.MarkAsFailed(time.Since(started).Milliseconds(), err)
+	task.OnComplete()
+	tm.cleanupTaskTracking(taskID)
 }
 
 // cleanupConcurrencyRetries removes tracking for completed task
