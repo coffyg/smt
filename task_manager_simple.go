@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"math"
 	"math/rand"
 	"net/url"
 	"os"
@@ -2058,13 +2057,24 @@ func (tm *TaskManagerSimple) calculateConcurrencyBackoff(taskID string) time.Dur
 	// Increment retry count
 	tm.concurrencyRetryMap.Store(taskID, retries+1)
 
-	// Exponential backoff: 5ms * 2^retries, capped at 800ms
+	// Exponential backoff: 5ms * 2^retries, capped at 800ms.
+	// Integer shift with a bounded exponent — NEVER float math here. The old
+	// float64 Pow path overflowed int64 at retries≥41: the float→Duration
+	// conversion pinned to minInt64 (negative), which skipped the `> maxDelay`
+	// cap, and the negative jitter then UNDERFLOWED the int64 addition and
+	// wrapped POSITIVE — producing 150-290 YEAR sleeps. Tasks vanished into
+	// eternal time.Sleep with no fail, no OnComplete (prod flight recorder
+	// 2026-07-21: goroutines asleep 544min, args 6.77e18/7.51e18/8.01e18 ns —
+	// jitter-spread of wrapped minInt64, retries 41+ after sustained slot misses).
 	baseDelay := 5 * time.Millisecond
 	maxDelay := 800 * time.Millisecond
 
-	exponentialDelay := time.Duration(float64(baseDelay) * math.Pow(2, float64(retries)))
-	if exponentialDelay > maxDelay {
-		exponentialDelay = maxDelay
+	exponentialDelay := maxDelay
+	if retries < 8 { // 5ms<<8 = 1.28s > cap; anything ≥8 is capped anyway
+		exponentialDelay = baseDelay << uint(retries)
+		if exponentialDelay > maxDelay {
+			exponentialDelay = maxDelay
+		}
 	}
 
 	// Add 0-50% jitter to prevent thundering herd
